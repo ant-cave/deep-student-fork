@@ -1,0 +1,589 @@
+/**
+ * 智能题目集管理视图
+ * 
+ * P1-2 功能：表格展示 + 筛选 + 批量操作
+ * 
+ * 🆕 2026-01 新增
+ */
+
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import { cn } from '@/lib/utils';
+import { NotionButton } from '@/components/ui/NotionButton';
+import { Input } from '@/components/ui/shad/Input';
+import { Checkbox } from '@/components/ui/shad/Checkbox';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/shad/Table';
+import { NotionAlertDialog } from '@/components/ui/NotionDialog';
+import {
+  AppMenu,
+  AppMenuTrigger,
+  AppMenuContent,
+  AppMenuItem,
+  AppMenuSeparator,
+} from '@/components/ui/app-menu/AppMenu';
+import { showGlobalNotification } from '@/components/UnifiedNotification';
+import {
+  MagnifyingGlass,
+  Funnel,
+  DotsThree,
+  Trash,
+  Star,
+  ArrowCounterClockwise,
+  CheckCircle,
+  XCircle,
+  CaretLeft,
+  CaretRight,
+  CircleNotch,
+  Download,
+  Upload,
+  Table as TableIcon,
+  Warning,
+  ClockCounterClockwise,
+} from '@phosphor-icons/react';
+import { useTranslation } from 'react-i18next';
+import type { Question, QuestionStatus, Difficulty, QuestionType } from '@/api/questionBankApi';
+
+interface QuestionBankManageViewProps {
+  questions: Question[];
+  isLoading?: boolean;
+  onSelect?: (questionIds: string[]) => void;
+  onDelete?: (questionIds: string[]) => Promise<void>;
+  onToggleFavorite?: (questionId: string) => Promise<void>;
+  onResetProgress?: (questionIds: string[]) => Promise<void>;
+  onViewDetail?: (question: Question) => void;
+  onViewHistory?: (questionId: string) => void;
+  onFilterChange?: (filters: QuestionFilters) => void;
+  /** CSV 导入按钮点击回调 */
+  onCsvImport?: () => void;
+  /** CSV 导出按钮点击回调 */
+  onCsvExport?: () => void;
+  /** 是否显示 CSV 操作按钮 */
+  showCsvActions?: boolean;
+  pagination?: {
+    page: number;
+    pageSize: number;
+    total: number;
+    onPageChange: (page: number) => void;
+  };
+}
+
+interface QuestionFilters {
+  search?: string;
+  status?: QuestionStatus[];
+  difficulty?: Difficulty[];
+  questionType?: QuestionType[];
+  isFavorite?: boolean;
+}
+
+const statusColors: Record<QuestionStatus, string> = {
+  new: 'text-muted-foreground',
+  in_progress: 'text-sky-600 dark:text-sky-400',
+  mastered: 'text-emerald-600 dark:text-emerald-400',
+  review: 'text-amber-600 dark:text-amber-400',
+};
+
+const statusLabelKeys: Record<QuestionStatus, string> = {
+  new: 'practice:questionBank.status.new',
+  in_progress: 'practice:questionBank.status.inProgress',
+  mastered: 'practice:questionBank.status.mastered',
+  review: 'practice:questionBank.status.review',
+};
+
+const difficultyColors: Record<Difficulty, string> = {
+  easy: 'text-emerald-600 dark:text-emerald-400',
+  medium: 'text-amber-600 dark:text-amber-400',
+  hard: 'text-orange-600 dark:text-orange-400',
+  very_hard: 'text-rose-600 dark:text-rose-400',
+};
+
+const difficultyLabelKeys: Record<Difficulty, string> = {
+  easy: 'practice:questionBank.difficulty.easy',
+  medium: 'practice:questionBank.difficulty.medium',
+  hard: 'practice:questionBank.difficulty.hard',
+  very_hard: 'practice:questionBank.difficulty.veryHard',
+};
+
+export const QuestionBankManageView: React.FC<QuestionBankManageViewProps> = ({
+  questions,
+  isLoading = false,
+  onSelect,
+  onDelete,
+  onToggleFavorite,
+  onResetProgress,
+  onViewDetail,
+  onViewHistory,
+  onFilterChange,
+  onCsvImport,
+  onCsvExport,
+  showCsvActions = true,
+  pagination,
+}) => {
+  const { t } = useTranslation(['exam_sheet', 'common', 'practice']);
+  
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [filters, setFilters] = useState<QuestionFilters>({});
+  const [showFilters, setShowFilters] = useState(false);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  
+  // 确认对话框状态
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [singleDeleteId, setSingleDeleteId] = useState<string | null>(null);
+  const [singleResetId, setSingleResetId] = useState<string | null>(null);
+
+  const allSelected = questions.length > 0 && selectedIds.size === questions.length;
+  const someSelected = selectedIds.size > 0 && selectedIds.size < questions.length;
+  const canDelete = Boolean(onDelete);
+  const canReset = Boolean(onResetProgress);
+  const canToggleFavorite = Boolean(onToggleFavorite);
+
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const visibleIds = new Set(questions.map((q) => q.id));
+      const next = new Set(Array.from(prev).filter((id) => visibleIds.has(id)));
+      if (next.size === prev.size) {
+        let unchanged = true;
+        for (const id of prev) {
+          if (!next.has(id)) {
+            unchanged = false;
+            break;
+          }
+        }
+        if (unchanged) return prev;
+      }
+      if (next.size !== prev.size) {
+        onSelect?.(Array.from(next));
+      }
+      return next;
+    });
+  }, [questions, onSelect]);
+
+  const handleSelectAll = useCallback(() => {
+    const nextSelected = allSelected ? new Set<string>() : new Set(questions.map(q => q.id));
+    setSelectedIds(nextSelected);
+    onSelect?.(Array.from(nextSelected));
+  }, [questions, allSelected, onSelect]);
+
+  const handleSelectOne = useCallback((id: string, checked: boolean) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (checked) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      onSelect?.(Array.from(next));
+      return next;
+    });
+  }, [onSelect]);
+
+  const handleFilterChange = useCallback((key: keyof QuestionFilters, value: unknown) => {
+    const newFilters = { ...filters, [key]: value };
+    setFilters(newFilters);
+    onFilterChange?.(newFilters);
+  }, [filters, onFilterChange]);
+
+  const handleToggleFavoriteAction = useCallback(async (questionId: string) => {
+    if (!onToggleFavorite) {
+      showGlobalNotification('warning', t('exam_sheet:questionBank.actionUnavailable', '当前操作不可用'));
+      return;
+    }
+    setActionLoading(`favorite:${questionId}`);
+    try {
+      await onToggleFavorite(questionId);
+      showGlobalNotification('success', t('exam_sheet:questionBank.favoriteUpdated', '收藏状态已更新'));
+    } catch (err: unknown) {
+      showGlobalNotification(
+        'error',
+        `${t('exam_sheet:questionBank.favoriteUpdateFailed', '更新收藏失败')}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      setActionLoading(null);
+    }
+  }, [onToggleFavorite, t]);
+
+  // 批量操作点击（显示确认对话框）
+  const handleBatchActionClick = useCallback((action: 'delete' | 'reset') => {
+    if (selectedIds.size === 0) return;
+    
+    if (action === 'delete') {
+      setSingleDeleteId(null);
+      setDeleteConfirmOpen(true);
+    } else if (action === 'reset') {
+      setSingleResetId(null);
+      setResetConfirmOpen(true);
+    }
+  }, [selectedIds.size]);
+  
+  // 单个操作点击（显示确认对话框）
+  const handleSingleDeleteClick = useCallback((id: string) => {
+    setSingleDeleteId(id);
+    setDeleteConfirmOpen(true);
+  }, []);
+  
+  const handleSingleResetClick = useCallback((id: string) => {
+    setSingleResetId(id);
+    setResetConfirmOpen(true);
+  }, []);
+  
+  // 确认删除
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!onDelete) {
+      showGlobalNotification('warning', t('exam_sheet:questionBank.actionUnavailable', '当前操作不可用'));
+      return;
+    }
+    const ids = singleDeleteId ? [singleDeleteId] : Array.from(selectedIds);
+    if (ids.length === 0) return;
+    
+    setDeleteConfirmOpen(false);
+    setActionLoading('delete');
+    try {
+      await onDelete(ids);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        ids.forEach((id) => next.delete(id));
+        onSelect?.(Array.from(next));
+        return next;
+      });
+    } catch (err: unknown) {
+      console.error('[QuestionBankManageView] handleDelete failed:', err);
+      const alreadyNotified =
+        err instanceof Error && (err as Error & { __notified?: boolean }).__notified === true;
+      if (!alreadyNotified) {
+        showGlobalNotification(
+          'error',
+          `${t('practice:questionBank.deleteFailed')}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    } finally {
+      setActionLoading(null);
+      setSingleDeleteId(null);
+    }
+  }, [singleDeleteId, selectedIds, onDelete, onSelect, t]);
+  
+  // 确认重置进度
+  const handleResetConfirm = useCallback(async () => {
+    if (!onResetProgress) {
+      showGlobalNotification('warning', t('exam_sheet:questionBank.actionUnavailable', '当前操作不可用'));
+      return;
+    }
+    const ids = singleResetId ? [singleResetId] : Array.from(selectedIds);
+    if (ids.length === 0) return;
+    
+    setResetConfirmOpen(false);
+    setActionLoading('reset');
+    try {
+      await onResetProgress(ids);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        ids.forEach((id) => next.delete(id));
+        onSelect?.(Array.from(next));
+        return next;
+      });
+    } catch (err: unknown) {
+      console.error('[QuestionBankManageView] handleReset failed:', err);
+      const alreadyNotified =
+        err instanceof Error && (err as Error & { __notified?: boolean }).__notified === true;
+      if (!alreadyNotified) {
+        showGlobalNotification(
+          'error',
+          `${t('practice:questionBank.resetFailed')}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    } finally {
+      setActionLoading(null);
+      setSingleResetId(null);
+    }
+  }, [singleResetId, selectedIds, onResetProgress, onSelect, t]);
+
+  const totalPages = pagination ? Math.ceil(pagination.total / pagination.pageSize) : 1;
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* 工具栏 - Notion 风格 */}
+      <div className="flex-shrink-0 px-4 py-2 space-y-2">
+        {/* 搜索和筛选 */}
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <MagnifyingGlass size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground/60" />
+            <Input
+              placeholder={t('exam_sheet:questionBank.search', '搜索题目...')}
+              value={filters.search || ''}
+              onChange={(e) => handleFilterChange('search', e.target.value)}
+              className="pl-9 h-8 text-sm bg-muted/30 border-transparent focus:border-border focus:bg-muted/20 focus-visible:ring-0 focus-visible:ring-offset-0 transition-colors"
+/>
+          </div>
+          
+          {/* CSV 导入导出按钮 */}
+          {showCsvActions && (
+            <div className="flex items-center gap-1">
+              {onCsvImport && (
+                <NotionButton variant="ghost" size="sm" onClick={onCsvImport} className="!h-auto !px-2.5 !py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-[var(--interactive-hover)]" title={t('exam_sheet:csv.import_title', 'CSV 导入')}>
+                  <Upload size={14} />
+                  <span className="hidden sm:inline">{t('exam_sheet:csv.import_title', 'CSV 导入')}</span>
+                </NotionButton>
+              )}
+              {onCsvExport && (
+                <NotionButton variant="ghost" size="sm" onClick={onCsvExport} className="!h-auto !px-2.5 !py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-[var(--interactive-hover)]" title={t('exam_sheet:questionBank.export.title', '导出')}>
+                  <Download size={14} />
+                  <span className="hidden sm:inline">{t('exam_sheet:questionBank.export.title', '导出')}</span>
+                </NotionButton>
+              )}
+            </div>
+          )}
+          
+          <NotionButton variant="ghost" size="sm" onClick={() => setShowFilters(!showFilters)} className={cn('!h-auto !px-2.5 !py-1.5 text-xs', showFilters ? 'bg-foreground text-background' : 'text-muted-foreground hover:text-foreground hover:bg-[var(--interactive-hover)]')}>
+            <Funnel size={14} />
+            {t('common:filter', '筛选')}
+          </NotionButton>
+        </div>
+
+        {/* 筛选器 - Notion 风格按钮组 */}
+        {showFilters && (
+          <div className="flex flex-wrap gap-1.5">
+            {/* 状态筛选 */}
+            <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-muted/30">
+              {(['all', 'new', 'in_progress', 'mastered', 'review'] as const).map((status) => (
+                <NotionButton key={status} variant="ghost" size="sm" onClick={() => handleFilterChange('status', status === 'all' ? undefined : [status as QuestionStatus])} className={cn('!h-auto !px-2 !py-1 text-xs', (status === 'all' && !filters.status) || filters.status?.[0] === status ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground hover:text-foreground')}>
+                  {status === 'all' ? t('practice:questionBank.all') : t(statusLabelKeys[status])}
+                </NotionButton>
+              ))}
+            </div>
+            
+            {/* 难度筛选 */}
+            <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-muted/30">
+              {(['all', 'easy', 'medium', 'hard', 'very_hard'] as const).map((diff) => (
+                <NotionButton key={diff} variant="ghost" size="sm" onClick={() => handleFilterChange('difficulty', diff === 'all' ? undefined : [diff as Difficulty])} className={cn('!h-auto !px-2 !py-1 text-xs', (diff === 'all' && !filters.difficulty) || filters.difficulty?.[0] === diff ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground hover:text-foreground')}>
+                  {diff === 'all' ? t('practice:questionBank.all') : t(difficultyLabelKeys[diff])}
+                </NotionButton>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* 批量操作 - 简化 */}
+        {selectedIds.size > 0 && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              {t('practice:questionBank.selectedCount', { count: selectedIds.size })}
+            </span>
+            <NotionButton variant="ghost" size="sm" onClick={() => handleBatchActionClick('reset')} disabled={!canReset || actionLoading === 'reset'} className="!h-auto !px-2 !py-1 text-xs text-sky-600 hover:bg-sky-500/10">
+              <ArrowCounterClockwise className={cn('w-3 h-3', actionLoading === 'reset' && 'animate-spin')} />
+              {t('practice:questionBank.reset')}
+            </NotionButton>
+            <NotionButton variant="ghost" size="sm" onClick={() => handleBatchActionClick('delete')} disabled={!canDelete || actionLoading === 'delete'} className="!h-auto !px-2 !py-1 text-xs text-rose-600 hover:bg-rose-500/10">
+              <Trash size={12} />
+              {t('common:delete')}
+            </NotionButton>
+          </div>
+        )}
+      </div>
+
+      {/* 表格 */}
+      <div className="flex-1 overflow-auto">
+        {isLoading ? (
+          <div className="flex items-center justify-center h-full">
+            <CircleNotch size={24} className="animate-spin text-muted-foreground" />
+          </div>
+        ) : questions.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+            <p>{t('exam_sheet:questionBank.empty', '暂无题目')}</p>
+          </div>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-10">
+                  <Checkbox
+                    checked={allSelected || (someSelected ? 'indeterminate' : false)}
+                    onCheckedChange={handleSelectAll}
+/>
+                </TableHead>
+                <TableHead className="w-16">{t('exam_sheet:questionBank.label', '题号')}</TableHead>
+                <TableHead>{t('exam_sheet:questionBank.content', '题目')}</TableHead>
+                <TableHead className="w-20">{t('practice:questionBank.statusHeader')}</TableHead>
+                {/* 窄屏隐藏次要列，保证题目内容可读 */}
+                <TableHead className="w-20 hidden md:table-cell">{t('practice:questionBank.difficultyHeader')}</TableHead>
+                <TableHead className="w-20 hidden md:table-cell">{t('exam_sheet:questionBank.attempts', '答题')}</TableHead>
+                <TableHead className="w-10"></TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {questions.map((q) => (
+                <TableRow
+                  key={q.id}
+                  className={cn(
+                    'cursor-pointer hover:bg-[var(--interactive-hover)]',
+                    selectedIds.has(q.id) && 'bg-muted/30'
+                  )}
+                  onClick={() => onViewDetail?.(q)}
+                >
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    <Checkbox
+                      checked={selectedIds.has(q.id)}
+                      onCheckedChange={(checked) => handleSelectOne(q.id, !!checked)}
+/>
+                  </TableCell>
+                  <TableCell className="font-mono text-sm">
+                    {q.questionLabel || q.cardId}
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-2">
+                      <span className="line-clamp-2 text-sm">
+                        {q.content.slice(0, 100)}
+                        {q.content.length > 100 && '...'}
+                      </span>
+                      {q.isCorrect === true && (
+                        <CheckCircle size={16} className="text-green-500 flex-shrink-0" />
+                      )}
+                      {q.isCorrect === false && (
+                        <XCircle size={16} className="text-red-500 flex-shrink-0" />
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <span className={cn('text-xs font-medium', statusColors[q.status])}>
+                      {t(statusLabelKeys[q.status])}
+                    </span>
+                  </TableCell>
+                  <TableCell className="hidden md:table-cell">
+                    {q.difficulty && (
+                      <span className={cn('text-xs font-medium', difficultyColors[q.difficulty])}>
+                        {t(difficultyLabelKeys[q.difficulty])}
+                      </span>
+                    )}
+                  </TableCell>
+                  <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
+                    {q.correctCount}/{q.attemptCount}
+                  </TableCell>
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    <AppMenu>
+                      <AppMenuTrigger asChild>
+                        <NotionButton variant="ghost" iconOnly size="sm" className="w-8 h-8" >
+                          <DotsThree size={16} />
+                        </NotionButton>
+                      </AppMenuTrigger>
+                      <AppMenuContent align="end" width={160}>
+                        <AppMenuItem
+                          onClick={() => onViewHistory?.(q.id)}
+                          icon={<ClockCounterClockwise size={16} />}
+                        >
+                          {t('exam_sheet:questionBank.history.title', '历史记录')}
+                        </AppMenuItem>
+                        <AppMenuSeparator />
+                        <AppMenuItem
+                          onClick={() => void handleToggleFavoriteAction(q.id)}
+                          disabled={!canToggleFavorite || actionLoading === `favorite:${q.id}` || isLoading}
+                          icon={q.isFavorite ? <Star size={16} /> : <Star size={16} />}
+                        >
+                          {q.isFavorite
+                            ? t('exam_sheet:questionBank.unfavorite', '取消收藏')
+                            : t('exam_sheet:questionBank.favorite', '收藏')}
+                        </AppMenuItem>
+                        <AppMenuSeparator />
+                        <AppMenuItem
+                          onClick={() => handleSingleResetClick(q.id)}
+                          disabled={!canReset}
+                          icon={<ArrowCounterClockwise size={16} />}
+                        >
+                          {t('exam_sheet:questionBank.resetProgress', '重置进度')}
+                        </AppMenuItem>
+                        <AppMenuItem
+                          onClick={() => handleSingleDeleteClick(q.id)}
+                          disabled={!canDelete}
+                          destructive
+                          icon={<Trash size={16} />}
+                        >
+                          {t('common:delete', '删除')}
+                        </AppMenuItem>
+                      </AppMenuContent>
+                    </AppMenu>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </div>
+
+      {/* 分页 */}
+      {pagination && totalPages > 1 && (
+        <div className="flex-shrink-0 flex items-center justify-between p-3 border-t border-border/50">
+          <span className="text-sm text-muted-foreground">
+            {t('common:pagination.info', '共 {{total}} 条', { total: pagination.total })}
+          </span>
+          <div className="flex items-center gap-1">
+            <NotionButton
+              variant="outline"
+              iconOnly size="sm"
+ className="w-8 h-8"               disabled={pagination.page <= 1}
+              onClick={() => pagination.onPageChange(pagination.page - 1)}
+            >
+              <CaretLeft size={16} />
+            </NotionButton>
+            <span className="text-sm px-2">
+              {pagination.page} / {totalPages}
+            </span>
+            <NotionButton
+              variant="outline"
+              iconOnly size="sm"
+ className="w-8 h-8"               disabled={pagination.page >= totalPages}
+              onClick={() => pagination.onPageChange(pagination.page + 1)}
+            >
+              <CaretRight size={16} />
+            </NotionButton>
+          </div>
+        </div>
+      )}
+      
+      {/* 删除确认对话框 */}
+      <NotionAlertDialog
+        open={deleteConfirmOpen}
+        onOpenChange={(open) => {
+          setDeleteConfirmOpen(open);
+          if (!open) setSingleDeleteId(null);
+        }}
+        icon={<Warning size={20} className="text-rose-500" />}
+        title={t('exam_sheet:questionBank.confirmDelete', '确认删除')}
+        description={
+          singleDeleteId 
+            ? t('exam_sheet:questionBank.confirmDeleteSingle', '确定要删除这道题目吗？此操作无法撤销。')
+            : t('exam_sheet:questionBank.confirmDeleteBatch', '确定要删除选中的 {{count}} 道题目吗？此操作无法撤销。', { count: selectedIds.size })
+        }
+        confirmText={t('common:delete', '删除')}
+        cancelText={t('common:cancel', '取消')}
+        confirmVariant="danger"
+        onConfirm={handleDeleteConfirm}
+/>
+      
+      {/* 重置进度确认对话框 */}
+      <NotionAlertDialog
+        open={resetConfirmOpen}
+        onOpenChange={(open) => {
+          setResetConfirmOpen(open);
+          if (!open) setSingleResetId(null);
+        }}
+        icon={<Warning size={20} className="text-amber-500" />}
+        title={t('exam_sheet:questionBank.confirmReset', '确认重置进度')}
+        description={
+          singleResetId
+            ? t('exam_sheet:questionBank.confirmResetSingle', '确定要重置这道题目的学习进度吗？这将清除所有答题记录、正确率统计，题目将恢复为“新题”状态。')
+            : t('exam_sheet:questionBank.confirmResetBatch', '确定要重置选中的 {{count}} 道题目的学习进度吗？这将清除所有答题记录、正确率统计，题目将恢复为“新题”状态。', { count: selectedIds.size })
+        }
+        confirmText={t('exam_sheet:questionBank.resetProgress', '重置进度')}
+        cancelText={t('common:cancel', '取消')}
+        confirmVariant="warning"
+        onConfirm={handleResetConfirm}
+/>
+    </div>
+  );
+};
+
+export default QuestionBankManageView;

@@ -1,0 +1,466 @@
+/**
+ * 组卷生成器组件
+ * 
+ * 功能：
+ * - 组卷配置面板（题型选择、数量设置、难度筛选）
+ * - 预览生成的试卷
+ * - 导出为 PDF/Word（待实现）
+ */
+
+import React, { useState, useCallback, useMemo } from 'react';
+import { cn } from '@/lib/utils';
+import { MarkdownRenderer } from '@/features/chat/components/renderers';
+import { NotionButton } from '@/components/ui/NotionButton';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/shad/Card';
+import { Badge } from '@/components/ui/shad/Badge';
+import { Input } from '@/components/ui/shad/Input';
+import { Label } from '@/components/ui/shad/Label';
+import { Switch } from '@/components/ui/shad/Switch';
+import { Slider } from '@/components/ui/shad/Slider';
+import { Checkbox } from '@/components/ui/shad/Checkbox';
+import { CustomScrollArea } from '@/components/custom-scroll-area';
+import {
+  FileText,
+  Download,
+  Eye,
+  GearSix,
+  Target,
+  Tag,
+  CircleNotch,
+  DownloadSimple,
+  Printer,
+  CaretDown,
+  CaretUp,
+  CheckCircle,
+} from '@phosphor-icons/react';
+import { invoke } from '@tauri-apps/api/core';
+import { useQuestionBankStore, PaperConfig, PaperExportFormat, GeneratedPaper, Question } from '@/stores/questionBankStore';
+import { useTranslation } from 'react-i18next';
+import { showGlobalNotification } from '@/components/UnifiedNotification';
+
+interface PaperGeneratorProps {
+  examId: string;
+  availableTags?: string[];
+  onGenerate?: (paper: GeneratedPaper) => void;
+  className?: string;
+}
+
+const QUESTION_TYPE_KEYS = [
+  'single_choice', 'multiple_choice', 'fill_blank', 'short_answer', 'essay', 'calculation', 'proof',
+];
+
+const DIFFICULTY_KEYS = [
+  { key: 'easy', color: 'text-emerald-600 bg-emerald-500/10' },
+  { key: 'medium', color: 'text-amber-600 bg-amber-500/10' },
+  { key: 'hard', color: 'text-orange-600 bg-orange-500/10' },
+  { key: 'very_hard', color: 'text-rose-600 bg-rose-500/10' },
+];
+
+const EXPORT_FORMAT_KEYS: Array<{ key: PaperExportFormat; icon: React.ReactNode }> = [
+  { key: 'preview', icon: <Eye size={16} /> },
+  { key: 'pdf', icon: <DownloadSimple size={16} /> },
+  { key: 'word', icon: <FileText size={16} /> },
+  { key: 'markdown', icon: <FileText size={16} /> },
+];
+
+export const PaperGenerator: React.FC<PaperGeneratorProps> = ({
+  examId,
+  availableTags = [],
+  onGenerate,
+  className,
+}) => {
+  const { t } = useTranslation('practice');
+  
+  // Store
+  const {
+    generatedPaper,
+    setGeneratedPaper,
+    generatePaper,
+    isLoadingPractice,
+  } = useQuestionBankStore();
+  
+  // 配置状态
+  const [title, setTitle] = useState(() => t('paper.defaultTitle', '练习试卷'));
+  const [typeSelection, setTypeSelection] = useState<Record<string, number>>({});
+  const [selectedDifficulties, setSelectedDifficulties] = useState<string[]>([]);
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [shuffle, setShuffle] = useState(true);
+  const [includeAnswers, setIncludeAnswers] = useState(true);
+  const [includeExplanations, setIncludeExplanations] = useState(true);
+  const [exportFormat, setExportFormat] = useState<PaperExportFormat>('preview');
+  
+  // UI 状态
+  const [showPreview, setShowPreview] = useState(false);
+  const [expandedQuestions, setExpandedQuestions] = useState<Set<string>>(new Set());
+  
+  // 计算总题数
+  const totalQuestions = useMemo(() => {
+    return Object.values(typeSelection).reduce((a, b) => a + b, 0);
+  }, [typeSelection]);
+  
+  // 更新题型数量
+  const handleTypeChange = useCallback((key: string, value: number) => {
+    setTypeSelection((prev) => ({
+      ...prev,
+      [key]: value,
+    }));
+  }, []);
+  
+  // 切换难度选择
+  const toggleDifficulty = useCallback((key: string) => {
+    setSelectedDifficulties((prev) =>
+      prev.includes(key)
+        ? prev.filter((d) => d !== key)
+        : [...prev, key]
+    );
+  }, []);
+  
+  // 切换标签选择
+  const toggleTag = useCallback((tag: string) => {
+    setSelectedTags((prev) =>
+      prev.includes(tag)
+        ? prev.filter((t) => t !== tag)
+        : [...prev, tag]
+    );
+  }, []);
+  
+  // 生成试卷
+  const handleGenerate = useCallback(async () => {
+    const config: PaperConfig = {
+      title,
+      type_selection: typeSelection,
+      difficulty_filter: selectedDifficulties.length > 0 ? selectedDifficulties : undefined,
+      tags_filter: selectedTags.length > 0 ? selectedTags : undefined,
+      shuffle,
+      include_answers: includeAnswers,
+      include_explanations: includeExplanations,
+      export_format: exportFormat,
+    };
+    
+    try {
+      const paper = await generatePaper(examId, config);
+      setShowPreview(true);
+      onGenerate?.(paper);
+    } catch (err: unknown) {
+      console.error('Failed to generate paper:', err);
+    }
+  }, [examId, title, typeSelection, selectedDifficulties, selectedTags, shuffle, includeAnswers, includeExplanations, exportFormat, generatePaper, onGenerate]);
+  
+  // 导出试卷：Markdown 直接落盘（复用 save 对话框 + save_text_to_file 后端命令）；
+  // PDF/Word 暂未实现，给出明确提示而非静默无反应（修复此前点击导出无任何反馈的缺口）。
+  const handleExport = useCallback(async () => {
+    if (!generatedPaper) return;
+    if (exportFormat !== 'markdown') {
+      showGlobalNotification('info', t('paper.exportComingSoon', 'PDF / Word 导出即将推出，可先用 Markdown 导出或预览'));
+      return;
+    }
+    try {
+      const answerLabel = t('paper.answer', '答案');
+      const explanationLabel = t('paper.explanation', '解析');
+      const lines: string[] = [`# ${generatedPaper.title}`, ''];
+      generatedPaper.questions.forEach((q, i) => {
+        lines.push(`## ${i + 1}. ${q.content}`, '');
+        if (q.options && q.options.length > 0) {
+          q.options.forEach((opt) => lines.push(`- ${opt.key}. ${opt.content}`));
+          lines.push('');
+        }
+        if (includeAnswers && q.answer) {
+          lines.push(`**${answerLabel}：** ${q.answer}`, '');
+        }
+        if (includeExplanations && q.explanation) {
+          lines.push(`**${explanationLabel}：** ${q.explanation}`, '');
+        }
+      });
+      const content = lines.join('\n');
+
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const path = await save({
+        title: t('paper.exportTitle', '导出试卷'),
+        defaultPath: `${generatedPaper.title || 'paper'}.md`,
+        filters: [{ name: 'Markdown', extensions: ['md'] }],
+      });
+      if (!path) return;
+
+      await invoke('save_text_to_file', { path, content });
+      showGlobalNotification('success', t('paper.exportSuccess', '试卷已导出'));
+    } catch (err: unknown) {
+      console.error('Failed to export paper:', err);
+      showGlobalNotification('error', t('paper.exportFailed', '导出失败，请重试'));
+    }
+  }, [generatedPaper, exportFormat, includeAnswers, includeExplanations, t]);
+  
+  // 切换题目展开
+  const toggleQuestion = useCallback((id: string) => {
+    setExpandedQuestions((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+  
+  // 预览界面
+  if (showPreview && generatedPaper) {
+    return (
+      <div className={cn('space-y-4', className)}>
+        <Card className="bg-transparent border-transparent shadow-none">
+          <CardHeader className="pb-4">
+            <div className="flex items-center justify-between">
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <FileText size={20} className="text-sky-500" />
+                {generatedPaper.title}
+              </CardTitle>
+              <div className="flex items-center gap-2">
+                <Badge variant="secondary">
+                  {generatedPaper.questions.length} {t('paper.questions', '题')}
+                </Badge>
+                <NotionButton
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowPreview(false)}
+                >
+                  {t('paper.back', '返回配置')}
+                </NotionButton>
+                {exportFormat !== 'preview' && (
+                  <NotionButton size="sm" onClick={handleExport}>
+                    <Download size={16} className="mr-1" />
+                    {t('paper.export', '导出')}
+                  </NotionButton>
+                )}
+              </div>
+            </div>
+          </CardHeader>
+        </Card>
+        
+        {/* 试卷内容 */}
+        <CustomScrollArea className="h-[calc(100vh-280px)]">
+          <div className="space-y-4 pr-4">
+            {generatedPaper.questions.map((question, idx) => (
+              <Card key={question.id} className="overflow-hidden">
+                <NotionButton variant="ghost" size="sm" className="!w-full !text-left !p-4 !h-auto !rounded-none hover:bg-[var(--interactive-hover)]" onClick={() => toggleQuestion(question.id)}>
+                  <div className="flex items-start gap-3">
+                    <Badge variant="outline" className="flex-shrink-0 font-mono">
+                      {idx + 1}
+                    </Badge>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm line-clamp-2">{question.content}</p>
+                    </div>
+                    {expandedQuestions.has(question.id) ? (
+                      <CaretUp size={16} className="text-muted-foreground flex-shrink-0" />
+                    ) : (
+                      <CaretDown size={16} className="text-muted-foreground flex-shrink-0" />
+                    )}
+                  </div>
+                </NotionButton>
+                
+                {expandedQuestions.has(question.id) && (
+                  <CardContent className="pt-0 space-y-3">
+                    {/* 选项 */}
+                    {question.options && question.options.length > 0 && (
+                      <div className="space-y-2 ml-8">
+                        {question.options.map((opt) => (
+                          <div key={opt.key} className="flex items-start gap-2 text-sm">
+                            <span className="font-medium text-muted-foreground">{opt.key}.</span>
+                            <span>{opt.content}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    
+                    {/* 答案 */}
+                    {includeAnswers && question.answer && (
+                      <div className="ml-8 p-3 rounded-lg bg-emerald-500/5 border border-emerald-500/20">
+                        <div className="flex items-center gap-1.5 text-sm font-medium text-emerald-600 mb-1">
+                          <CheckCircle size={16} />
+                          {t('paper.answer', '答案')}
+                        </div>
+                        <div className="text-sm"><MarkdownRenderer content={question.answer} /></div>
+                      </div>
+                    )}
+                    
+                    {/* 解析 */}
+                    {includeExplanations && question.explanation && (
+                      <div className="ml-8 p-3 rounded-lg bg-sky-500/5 border border-sky-500/20">
+                        <div className="text-sm font-medium text-sky-600 mb-1">
+                          {t('paper.explanation', '解析')}
+                        </div>
+                        <div className="text-sm text-muted-foreground"><MarkdownRenderer content={question.explanation} /></div>
+                      </div>
+                    )}
+                  </CardContent>
+                )}
+              </Card>
+            ))}
+          </div>
+        </CustomScrollArea>
+      </div>
+    );
+  }
+  
+  // 配置界面
+  return (
+    <Card className={cn('', className)}>
+      <CardHeader className="pb-4">
+        <CardTitle className="flex items-center gap-2 text-lg">
+          <FileText size={20} className="text-sky-500" />
+          {t('paper.title', '组卷生成器')}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        {/* 试卷标题 */}
+        <div className="space-y-2">
+          <Label>{t('paper.paperTitle', '试卷标题')}</Label>
+          <Input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder={t('paper.titlePlaceholder', '请输入试卷标题')}
+/>
+        </div>
+        
+        {/* 题型选择 */}
+        <div className="space-y-3">
+          <Label className="flex items-center gap-1">
+            <GearSix size={16} />
+            {t('paper.typeSelection', '题型配置')}
+          </Label>
+          <div className="space-y-2">
+            {QUESTION_TYPE_KEYS.map((key) => (
+              <div key={key} className="flex items-center gap-3">
+                <span className="text-sm w-20">{t(`questionType.${key}`)}</span>
+                <Slider
+                  value={[typeSelection[key] || 0]}
+                  onValueChange={(v) => handleTypeChange(key, v[0])}
+                  max={20}
+                  step={1}
+                  className="flex-1"
+/>
+                <span className="text-sm w-8 text-right font-medium">
+                  {typeSelection[key] || 0}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="text-sm text-muted-foreground">
+            {t('paper.totalSelected', '共选择')} <span className="font-medium text-foreground">{totalQuestions}</span> {t('paper.questions', '题')}
+          </div>
+        </div>
+        
+        {/* 难度筛选 */}
+        <div className="space-y-3">
+          <Label className="flex items-center gap-1">
+            <Target size={16} />
+            {t('paper.difficultyFilter', '难度筛选')}
+            <span className="text-muted-foreground text-xs">{t('paper.noRestriction', '（不选则不限制）')}</span>
+          </Label>
+          <div className="flex flex-wrap gap-2">
+            {DIFFICULTY_KEYS.map(({ key, color }) => (
+              <NotionButton
+                key={key}
+                variant="ghost" size="sm"
+                onClick={() => toggleDifficulty(key)}
+                className={cn(
+                  '!px-3 !py-1.5 !rounded-full !h-auto text-sm font-medium',
+                  selectedDifficulties.includes(key)
+                    ? color
+                    : 'bg-muted text-muted-foreground hover:bg-[var(--interactive-hover)]'
+                )}
+              >
+                {t(`difficultyLevel.${key}`)}
+              </NotionButton>
+            ))}
+          </div>
+        </div>
+        
+        {/* 标签筛选 */}
+        {availableTags.length > 0 && (
+          <div className="space-y-3">
+            <Label className="flex items-center gap-1">
+              <Tag size={16} />
+              {t('paper.tagsFilter', '标签筛选')}
+              <span className="text-muted-foreground text-xs">{t('paper.noRestriction', '（不选则不限制）')}</span>
+            </Label>
+            <div className="flex flex-wrap gap-2">
+              {availableTags.map((tag) => (
+                <NotionButton
+                  key={tag}
+                  variant="ghost" size="sm"
+                  onClick={() => toggleTag(tag)}
+                  className={cn(
+                    '!px-3 !py-1.5 !rounded-full !h-auto text-sm',
+                    selectedTags.includes(tag)
+                      ? 'bg-sky-500/20 text-sky-600'
+                      : 'bg-muted text-muted-foreground hover:bg-[var(--interactive-hover)]'
+                  )}
+                >
+                  {tag}
+                </NotionButton>
+              ))}
+            </div>
+          </div>
+        )}
+        
+        {/* 其他选项 */}
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <Label>{t('paper.shuffle', '打乱题目顺序')}</Label>
+            <Switch checked={shuffle} onCheckedChange={setShuffle} />
+          </div>
+          <div className="flex items-center justify-between">
+            <Label>{t('paper.includeAnswers', '包含答案')}</Label>
+            <Switch checked={includeAnswers} onCheckedChange={setIncludeAnswers} />
+          </div>
+          <div className="flex items-center justify-between">
+            <Label>{t('paper.includeExplanations', '包含解析')}</Label>
+            <Switch checked={includeExplanations} onCheckedChange={setIncludeExplanations} />
+          </div>
+        </div>
+        
+        {/* 导出格式 */}
+        <div className="space-y-2">
+          <Label>{t('paper.exportFormat', '导出格式')}</Label>
+          <div className="grid grid-cols-4 gap-2">
+            {EXPORT_FORMAT_KEYS.map(({ key, icon }) => (
+              <NotionButton
+                key={key}
+                variant="ghost" size="sm"
+                onClick={() => setExportFormat(key)}
+                className={cn(
+                  '!flex !flex-col !items-center !gap-1 !p-3 !h-auto !rounded-lg border',
+                  exportFormat === key
+                    ? 'border-sky-500 bg-sky-500/10 text-sky-600'
+                    : 'border-border hover:bg-[var(--interactive-hover)]'
+                )}
+              >
+                {icon}
+                <span className="text-xs">{t(`paper.format.${key}`)}</span>
+              </NotionButton>
+            ))}
+          </div>
+        </div>
+        
+        <NotionButton
+          onClick={handleGenerate}
+          disabled={isLoadingPractice || totalQuestions === 0}
+          className="w-full h-12 text-lg"
+        >
+          {isLoadingPractice ? (
+            <>
+              <CircleNotch size={20} className="mr-2 animate-spin" />
+              {t('paper.generating', '生成中...')}
+            </>
+          ) : (
+            <>
+              <FileText size={20} className="mr-2" />
+              {t('paper.generate', '生成试卷')}
+            </>
+          )}
+        </NotionButton>
+      </CardContent>
+    </Card>
+  );
+};
+
+export default PaperGenerator;

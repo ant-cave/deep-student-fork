@@ -1,0 +1,1030 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use super::executor::{ExecutionContext, ToolExecutor, ToolSensitivity};
+use super::strip_tool_namespace;
+use crate::chat_v2::events::event_types;
+use crate::chat_v2::types::{ToolCall, ToolResultInfo};
+use crate::memory::{MemoryOpSource, MemoryOpType, MemoryService, MemoryType, OpTimer, WriteMode};
+use crate::vfs::lance_store::VfsLanceStore;
+
+pub const MEMORY_SEARCH: &str = "builtin-memory_search";
+pub const MEMORY_READ: &str = "builtin-memory_read";
+pub const MEMORY_WRITE: &str = "builtin-memory_write";
+pub const MEMORY_LIST: &str = "builtin-memory_list";
+pub const MEMORY_UPDATE_BY_ID: &str = "builtin-memory_update_by_id";
+pub const MEMORY_DELETE: &str = "builtin-memory_delete";
+pub const MEMORY_WRITE_SMART: &str = "builtin-memory_write_smart";
+pub const MEMORY_WRITE_BATCH: &str = "builtin-memory_write_batch";
+
+pub struct MemoryToolExecutor;
+
+impl MemoryToolExecutor {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// 检查工具名是否为 Memory 工具
+    fn is_memory_tool(tool_name: &str) -> bool {
+        let stripped = strip_tool_namespace(tool_name);
+        matches!(
+            stripped,
+            "memory_search"
+                | "memory_read"
+                | "memory_write"
+                | "memory_list"
+                | "memory_update_by_id"
+                | "memory_delete"
+                | "memory_write_smart"
+                | "memory_write_batch"
+        )
+    }
+
+    fn needs_root_bootstrap(root_folder_id: Option<&str>) -> bool {
+        root_folder_id.is_none()
+    }
+
+    fn parse_memory_type(
+        raw: Option<&str>,
+        default_type: MemoryType,
+    ) -> Result<MemoryType, String> {
+        match raw {
+            Some("fact") => Ok(MemoryType::Fact),
+            Some("study") => Ok(MemoryType::Study),
+            Some("note") => Ok(MemoryType::Note),
+            Some(other) => Err(format!(
+                "Invalid memory_type '{}': expected fact, study, or note",
+                other
+            )),
+            None => Ok(default_type),
+        }
+    }
+
+    fn get_service(&self, ctx: &ExecutionContext) -> Result<MemoryService, String> {
+        let vfs_db = ctx.vfs_db.as_ref().ok_or("VFS database not available")?;
+        let llm_manager = ctx
+            .llm_manager
+            .as_ref()
+            .ok_or("LLM manager not available")?;
+
+        let lance_store = ctx
+            .vfs_lance_store
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| VfsLanceStore::new(vfs_db.clone()).map(Arc::new))
+            .map_err(|e| format!("Failed to create lance store: {}", e))?;
+
+        Ok(MemoryService::new(
+            vfs_db.clone(),
+            lance_store,
+            llm_manager.clone(),
+        ))
+    }
+
+    fn ensure_root_configured(&self, service: &MemoryService) -> Result<(), Value> {
+        let config = service.get_config().map_err(|e| {
+            json!({
+                "error": "记忆功能配置读取失败",
+                "details": e.to_string()
+            })
+        })?;
+
+        if Self::needs_root_bootstrap(config.memory_root_folder_id.as_deref()) {
+            let folder_id = service.get_or_create_root_folder().map_err(|e| {
+                json!({
+                    "error": "记忆根文件夹初始化失败",
+                    "hint": "请前往「学习资源中心 > 记忆管理」手动设置记忆根文件夹，或前往数据治理进行修复",
+                    "details": e.to_string(),
+                    "action_required": true
+                })
+            })?;
+            log::info!(
+                "[MemoryToolExecutor] Auto-created memory root folder for first use: {}",
+                folder_id
+            );
+        }
+        Ok(())
+    }
+
+    async fn execute_search(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecutionContext,
+    ) -> Result<Value, String> {
+        // 🆕 取消检查：在执行前检查是否已取消
+        if ctx.is_cancelled() {
+            return Err("Memory search cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'query' parameter")?;
+
+        let top_k = call
+            .arguments
+            .get("top_k")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(5);
+
+        let results = if let Some(cancel_token) = ctx.cancellation_token() {
+            tokio::select! {
+                res = service.search_with_rerank(query, top_k, false) => res.map_err(|e| e.to_string())?,
+                _ = cancel_token.cancelled() => {
+                    log::info!("[MemoryToolExecutor] Memory search cancelled");
+                    return Err("Memory search cancelled during execution".to_string());
+                }
+            }
+        } else {
+            service
+                .search_with_rerank(query, top_k, false)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+
+        // 兼容检索块与来源面板：输出统一的 sources 结构，
+        // 同时保留 results 字段给旧调用方。
+        let sources: Vec<Value> = results
+            .iter()
+            .map(|item| {
+                json!({
+                    "title": item.note_title,
+                    "snippet": item.chunk_text,
+                    "score": item.score,
+                    "metadata": {
+                        "document_id": item.note_id,
+                        "memory_id": item.note_id,
+                        "note_id": item.note_id,
+                        "folder_path": item.folder_path,
+                        "source_type": "memory"
+                    }
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "sources": sources,
+            "results": results,
+            "count": results.len()
+        }))
+    }
+
+    async fn execute_read(&self, call: &ToolCall, ctx: &ExecutionContext) -> Result<Value, String> {
+        // 🆕 取消检查：在执行前检查是否已取消
+        if ctx.is_cancelled() {
+            return Err("Memory read cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let note_id = call
+            .arguments
+            .get("note_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'note_id' parameter")?;
+
+        let note_id_owned = note_id.to_string();
+
+        // 🆕 取消支持：使用 spawn_blocking + tokio::select! 监听取消信号
+        let read_task = {
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || service.read(&note_id_owned))
+        };
+
+        let result = if let Some(cancel_token) = ctx.cancellation_token() {
+            tokio::select! {
+                res = read_task => res.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?,
+                _ = cancel_token.cancelled() => {
+                    log::info!("[MemoryToolExecutor] Memory read cancelled");
+                    return Err("Memory read cancelled during execution".to_string());
+                }
+            }
+        } else {
+            read_task
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?
+        };
+
+        match result {
+            Some((note, content)) => Ok(json!({
+                "found": true,
+                "note_id": note.id,
+                "title": note.title,
+                "content": content,
+                "updated_at": note.updated_at
+            })),
+            None => Ok(json!({
+                "found": false,
+                "note_id": note_id
+            })),
+        }
+    }
+
+    async fn execute_write(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecutionContext,
+    ) -> Result<Value, String> {
+        if ctx.is_cancelled() {
+            return Err("Memory write cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let note_id = call
+            .arguments
+            .get("note_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let title = call
+            .arguments
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let content = call
+            .arguments
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let folder = call
+            .arguments
+            .get("folder")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // ★ 修复不一致：工具路径也需要敏感信息过滤
+        if let Some(ref c) = content {
+            if crate::memory::auto_extractor::MemoryAutoExtractor::contains_sensitive_pattern_pub(c)
+            {
+                service.audit_logger().log_filtered(
+                    MemoryOpSource::ToolCall,
+                    title.as_deref().unwrap_or(""),
+                    c,
+                    "包含敏感信息（手机号/身份证/银行卡/邮箱/密码）",
+                );
+                return Ok(json!({
+                    "success": false,
+                    "error": "内容包含敏感信息，已拦截。请勿在记忆中存储个人敏感信息。"
+                }));
+            }
+        }
+        if let Some(ref t) = title {
+            if crate::memory::auto_extractor::MemoryAutoExtractor::contains_sensitive_pattern_pub(t)
+            {
+                service.audit_logger().log_filtered(
+                    MemoryOpSource::ToolCall,
+                    t,
+                    content.as_deref().unwrap_or(""),
+                    "标题包含敏感信息",
+                );
+                return Ok(json!({
+                    "success": false,
+                    "error": "标题包含敏感信息，已拦截。"
+                }));
+            }
+        }
+
+        let mode_str = call
+            .arguments
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or(if note_id.is_some() {
+                "update"
+            } else {
+                "create"
+            });
+
+        let mode = WriteMode::from_str(mode_str);
+        let timer = OpTimer::start();
+
+        let write_task = {
+            let service = service.clone();
+            let note_id = note_id.clone();
+            let title = title.clone();
+            let content = content.clone();
+            let folder = folder.clone();
+            tokio::task::spawn_blocking(move || -> Result<_, String> {
+                if let Some(ref note_id) = note_id {
+                    match mode {
+                        WriteMode::Append => {
+                            let current = service
+                                .read(note_id)
+                                .map_err(|e| e.to_string())?
+                                .map(|(_, c)| c)
+                                .unwrap_or_default();
+                            let append_content =
+                                content.as_ref().ok_or("Missing 'content' parameter")?;
+                            let final_content = format!("{}\n\n{}", current, append_content);
+                            service
+                                .update_by_id_with_source(
+                                    note_id,
+                                    title.as_deref(),
+                                    Some(&final_content),
+                                    MemoryOpSource::ToolCall,
+                                    None,
+                                )
+                                .map_err(|e| e.to_string())
+                        }
+                        _ => {
+                            if title.is_none() && content.is_none() {
+                                return Err("Missing 'title' or 'content' parameter".to_string());
+                            }
+                            service
+                                .update_by_id_with_source(
+                                    note_id,
+                                    title.as_deref(),
+                                    content.as_deref(),
+                                    MemoryOpSource::ToolCall,
+                                    None,
+                                )
+                                .map_err(|e| e.to_string())
+                        }
+                    }
+                } else {
+                    let title = title.as_ref().ok_or("Missing 'title' parameter")?;
+                    let content = content.as_ref().ok_or("Missing 'content' parameter")?;
+                    service
+                        .write(folder.as_deref(), title, content, mode)
+                        .map_err(|e| e.to_string())
+                }
+            })
+        };
+
+        let result = if let Some(cancel_token) = ctx.cancellation_token() {
+            tokio::select! {
+                res = write_task => res.map_err(|e| e.to_string())??,
+                _ = cancel_token.cancelled() => {
+                    log::info!("[MemoryToolExecutor] Memory write cancelled");
+                    return Err("Memory write cancelled during execution".to_string());
+                }
+            }
+        } else {
+            write_task.await.map_err(|e| e.to_string())??
+        };
+
+        if note_id.is_none() {
+            service
+                .audit_logger()
+                .log(&crate::memory::audit_log::MemoryAuditEntry {
+                    source: MemoryOpSource::ToolCall,
+                    operation: MemoryOpType::Write,
+                    success: true,
+                    note_id: Some(result.note_id.clone()),
+                    title: title.clone(),
+                    content_preview: content.clone(),
+                    folder: folder.clone(),
+                    event: Some(if result.is_new { "ADD" } else { "UPDATE" }.to_string()),
+                    confidence: None,
+                    reason: None,
+                    session_id: None,
+                    duration_ms: Some(timer.elapsed_ms()),
+                    extra_json: None,
+                });
+        }
+
+        let svc_for_idx = self.get_service(ctx).ok();
+        if let Some(svc) = svc_for_idx {
+            let resource_id = result.resource_id.clone();
+            tokio::spawn(async move {
+                svc.index_resource_immediately(&resource_id).await;
+            });
+        }
+        service.spawn_post_write_maintenance();
+
+        Ok(json!({
+            "success": true,
+            "note_id": result.note_id,
+            "is_new": result.is_new
+        }))
+    }
+
+    async fn execute_list(&self, call: &ToolCall, ctx: &ExecutionContext) -> Result<Value, String> {
+        // 🆕 取消检查：在执行前检查是否已取消
+        if ctx.is_cancelled() {
+            return Err("Memory list cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let folder = call
+            .arguments
+            .get("folder")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let limit = call
+            .arguments
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(100);
+        let offset = call
+            .arguments
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(0);
+
+        // 🆕 取消支持：使用 spawn_blocking + tokio::select! 监听取消信号
+        let list_task = {
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || service.list(folder.as_deref(), limit, offset))
+        };
+
+        let items = if let Some(cancel_token) = ctx.cancellation_token() {
+            tokio::select! {
+                res = list_task => res.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?,
+                _ = cancel_token.cancelled() => {
+                    log::info!("[MemoryToolExecutor] Memory list cancelled");
+                    return Err("Memory list cancelled during execution".to_string());
+                }
+            }
+        } else {
+            list_task
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?
+        };
+
+        Ok(json!({
+            "items": items,
+            "count": items.len()
+        }))
+    }
+
+    async fn execute_update_by_id(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecutionContext,
+    ) -> Result<Value, String> {
+        // 🆕 取消检查：在执行前检查是否已取消
+        if ctx.is_cancelled() {
+            return Err("Memory update cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let note_id = call
+            .arguments
+            .get("note_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'note_id' parameter")?
+            .to_string();
+        let title = call
+            .arguments
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let content = call
+            .arguments
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if title.is_none() && content.is_none() {
+            return Err("Missing 'title' or 'content' parameter".to_string());
+        }
+
+        // 🆕 取消支持：使用 spawn_blocking + tokio::select! 监听取消信号
+        let update_task = {
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || {
+                service.update_by_id_with_source(
+                    &note_id,
+                    title.as_deref(),
+                    content.as_deref(),
+                    MemoryOpSource::ToolCall,
+                    None,
+                )
+            })
+        };
+
+        let result = if let Some(cancel_token) = ctx.cancellation_token() {
+            tokio::select! {
+                res = update_task => res.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?,
+                _ = cancel_token.cancelled() => {
+                    log::info!("[MemoryToolExecutor] Memory update cancelled");
+                    return Err("Memory update cancelled during execution".to_string());
+                }
+            }
+        } else {
+            update_task
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?
+        };
+
+        // 更新后即时索引，保证 write-then-search SLA（与 handler 路径对齐）
+        let svc_for_idx = self.get_service(ctx).ok();
+        if let Some(svc) = svc_for_idx {
+            let resource_id = result.resource_id.clone();
+            tokio::spawn(async move {
+                svc.index_resource_immediately(&resource_id).await;
+            });
+        }
+        service.spawn_post_write_maintenance();
+
+        Ok(json!({
+            "success": true,
+            "note_id": result.note_id,
+            "is_new": result.is_new
+        }))
+    }
+
+    async fn execute_delete(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecutionContext,
+    ) -> Result<Value, String> {
+        // 🆕 取消检查：在执行前检查是否已取消
+        if ctx.is_cancelled() {
+            return Err("Memory delete cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let note_id = call
+            .arguments
+            .get("note_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'note_id' parameter")?;
+
+        // 🆕 取消支持：使用 tokio::select! 监听取消信号
+        if let Some(cancel_token) = ctx.cancellation_token() {
+            tokio::select! {
+                res = service.delete_with_source(note_id, MemoryOpSource::ToolCall, None) => res.map_err(|e| e.to_string())?,
+                _ = cancel_token.cancelled() => {
+                    log::info!("[MemoryToolExecutor] Memory delete cancelled");
+                    return Err("Memory delete cancelled during execution".to_string());
+                }
+            }
+        } else {
+            service
+                .delete_with_source(note_id, MemoryOpSource::ToolCall, None)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        service.spawn_post_write_maintenance();
+        Ok(json!({ "success": true, "note_id": note_id }))
+    }
+
+    async fn execute_write_smart(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecutionContext,
+    ) -> Result<Value, String> {
+        if ctx.is_cancelled() {
+            return Err("Memory write_smart cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let title = call
+            .arguments
+            .get("title")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'title' parameter")?;
+        let content = call
+            .arguments
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'content' parameter")?;
+        let folder = call.arguments.get("folder").and_then(|v| v.as_str());
+        let memory_type = Self::parse_memory_type(
+            call.arguments.get("memory_type").and_then(|v| v.as_str()),
+            MemoryType::Fact,
+        )?;
+        let memory_purpose = call
+            .arguments
+            .get("memory_purpose")
+            .and_then(|v| v.as_str())
+            .map(crate::memory::MemoryPurpose::from_str);
+
+        // 敏感信息过滤（所有类型都检查）
+        if crate::memory::auto_extractor::MemoryAutoExtractor::contains_sensitive_pattern_pub(
+            content,
+        ) || crate::memory::auto_extractor::MemoryAutoExtractor::contains_sensitive_pattern_pub(
+            title,
+        ) {
+            service.audit_logger().log_filtered(
+                MemoryOpSource::ToolCall,
+                title,
+                content,
+                "包含敏感信息（手机号/身份证/银行卡/邮箱/密码）",
+            );
+            return Ok(json!({
+                "note_id": "",
+                "event": "FILTERED",
+                "is_new": false,
+                "confidence": 1.0,
+                "reason": "内容包含敏感信息（手机号/身份证/银行卡/邮箱/密码），已拦截。请勿在记忆中存储个人敏感信息。",
+                "downgraded": false
+            }));
+        }
+
+        // 内容长度限制（按类型区分）
+        let max_chars = memory_type.max_content_chars();
+        if content.chars().count() > max_chars {
+            service.audit_logger().log_filtered(
+                MemoryOpSource::ToolCall,
+                title,
+                content,
+                &format!(
+                    "内容超过 {} 字限制（类型: {}）",
+                    max_chars,
+                    memory_type.as_str()
+                ),
+            );
+            let hint = match memory_type {
+                MemoryType::Fact => format!(
+                    "原子事实记忆内容过长（超过 {} 字）。请拆分为多条简短事实，或使用 memory_type='study' / 'note'。",
+                    max_chars
+                ),
+                MemoryType::Study => {
+                    format!("学习记忆内容过长（超过 {} 字）。请精简或拆分为多条。", max_chars)
+                }
+                MemoryType::Note => {
+                    format!("经验笔记内容过长（超过 {} 字）。请精简内容。", max_chars)
+                }
+            };
+            return Ok(json!({
+                "note_id": "",
+                "event": "FILTERED",
+                "is_new": false,
+                "confidence": 1.0,
+                "reason": hint,
+                "downgraded": false
+            }));
+        }
+
+        let result = if let Some(cancel_token) = ctx.cancellation_token() {
+            let idempotency_key = Self::resolve_idempotency_key(
+                call,
+                &ctx.session_id,
+                &ctx.message_id,
+                folder,
+                title,
+                content,
+                memory_type,
+                memory_purpose,
+            );
+            tokio::select! {
+                res = service.write_smart_with_source(
+                    folder,
+                    title,
+                    content,
+                    MemoryOpSource::ToolCall,
+                    Some(&ctx.session_id),
+                    memory_type,
+                    memory_purpose,
+                    Some(idempotency_key.as_str()),
+                ) => res.map_err(|e| e.to_string())?,
+                _ = cancel_token.cancelled() => {
+                    log::info!("[MemoryToolExecutor] Memory write_smart cancelled");
+                    return Err("Memory write_smart cancelled during execution".to_string());
+                }
+            }
+        } else {
+            let idempotency_key = Self::resolve_idempotency_key(
+                call,
+                &ctx.session_id,
+                &ctx.message_id,
+                folder,
+                title,
+                content,
+                memory_type,
+                memory_purpose,
+            );
+            service
+                .write_smart_with_source(
+                    folder,
+                    title,
+                    content,
+                    MemoryOpSource::ToolCall,
+                    Some(&ctx.session_id),
+                    memory_type,
+                    memory_purpose,
+                    Some(idempotency_key.as_str()),
+                )
+                .await
+                .map_err(|e| e.to_string())?
+        };
+
+        if result.event != "NONE" && result.event != "FILTERED" {
+            service.spawn_post_write_maintenance();
+        }
+
+        Ok(json!({
+            "note_id": result.note_id,
+            "event": result.event,
+            "is_new": result.is_new,
+            "confidence": result.confidence,
+            "reason": result.reason,
+            "downgraded": result.downgraded
+        }))
+    }
+
+    async fn execute_write_batch(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecutionContext,
+    ) -> Result<Value, String> {
+        if ctx.is_cancelled() {
+            return Err("Memory write_batch cancelled before start".to_string());
+        }
+
+        let service = self.get_service(ctx)?;
+        if let Err(hint) = self.ensure_root_configured(&service) {
+            return Ok(hint);
+        }
+
+        let items = call
+            .arguments
+            .get("items")
+            .and_then(|v| v.as_array())
+            .ok_or("Missing 'items' parameter")?;
+        let default_folder = call.arguments.get("folder").and_then(|v| v.as_str());
+        let default_memory_type = Self::parse_memory_type(
+            call.arguments.get("memory_type").and_then(|v| v.as_str()),
+            MemoryType::Study,
+        )?;
+        let default_memory_purpose = call
+            .arguments
+            .get("memory_purpose")
+            .and_then(|v| v.as_str())
+            .map(crate::memory::MemoryPurpose::from_str);
+
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        let mut skipped = 0usize;
+        let mut filtered = 0usize;
+        let mut results = Vec::with_capacity(items.len());
+        let mut resource_ids = Vec::new();
+
+        for (index, item) in items.iter().enumerate() {
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .ok_or("Each batch item requires 'title'")?;
+            let content = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("Each batch item requires 'content'")?;
+            let folder = item
+                .get("folder")
+                .or_else(|| item.get("folder_path"))
+                .and_then(|v| v.as_str())
+                .or(default_folder);
+            let memory_type = Self::parse_memory_type(
+                item.get("memory_type").and_then(|v| v.as_str()),
+                default_memory_type,
+            )?;
+            let memory_purpose = item
+                .get("memory_purpose")
+                .and_then(|v| v.as_str())
+                .map(crate::memory::MemoryPurpose::from_str)
+                .or(default_memory_purpose);
+            let idempotency_key = item
+                .get("idempotency_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}:{}:{}",
+                        ctx.message_id,
+                        index,
+                        Self::resolve_idempotency_key(
+                            call,
+                            &ctx.session_id,
+                            &ctx.message_id,
+                            folder,
+                            title,
+                            content,
+                            memory_type,
+                            memory_purpose,
+                        )
+                    )
+                });
+
+            let output = match memory_type {
+                MemoryType::Fact => service
+                    .write_smart_with_source(
+                        folder,
+                        title,
+                        content,
+                        MemoryOpSource::ToolCall,
+                        Some(&ctx.session_id),
+                        memory_type,
+                        memory_purpose,
+                        Some(idempotency_key.as_str()),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+                _ => service
+                    .write_explicit_memory(folder, title, content, memory_type, memory_purpose)
+                    .map_err(|e| e.to_string())?,
+            };
+
+            match output.event.as_str() {
+                "ADD" => added += 1,
+                "UPDATE" | "APPEND" | "DELETE" => updated += 1,
+                "FILTERED" => filtered += 1,
+                _ => skipped += 1,
+            }
+            if let Some(resource_id) = &output.resource_id {
+                resource_ids.push(resource_id.clone());
+            }
+            results.push(json!({
+                "title": title,
+                "note_id": output.note_id,
+                "event": output.event,
+                "is_new": output.is_new,
+                "confidence": output.confidence,
+                "reason": output.reason,
+                "downgraded": output.downgraded,
+            }));
+        }
+
+        if added + updated > 0 {
+            for resource_id in resource_ids {
+                let svc = service.clone();
+                tokio::spawn(async move {
+                    svc.index_resource_immediately(&resource_id).await;
+                });
+            }
+            service.spawn_post_write_maintenance();
+        }
+
+        Ok(json!({
+            "total": items.len(),
+            "succeeded": added + updated,
+            "failed": filtered,
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+            "filtered": filtered,
+            "results": results,
+        }))
+    }
+}
+
+impl MemoryToolExecutor {
+    fn resolve_idempotency_key(
+        call: &ToolCall,
+        session_id: &str,
+        message_id: &str,
+        folder: Option<&str>,
+        title: &str,
+        content: &str,
+        memory_type: MemoryType,
+        memory_purpose: Option<crate::memory::MemoryPurpose>,
+    ) -> String {
+        if let Some(explicit) = call
+            .arguments
+            .get("idempotency_key")
+            .or_else(|| call.arguments.get("idempotencyKey"))
+            .and_then(|v| v.as_str())
+        {
+            let explicit = explicit.trim();
+            if !explicit.is_empty() {
+                return explicit.to_string();
+            }
+        }
+
+        let normalized = format!(
+            "{}|{}|{}|{}|{}",
+            folder.unwrap_or("").trim().to_lowercase(),
+            title.trim().to_lowercase(),
+            content.trim().to_lowercase(),
+            memory_type.as_str(),
+            memory_purpose.map(|p| p.as_str()).unwrap_or(""),
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        format!("mem:{}:{}:{}", session_id, message_id, digest)
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for MemoryToolExecutor {
+    fn can_handle(&self, tool_name: &str) -> bool {
+        Self::is_memory_tool(tool_name)
+    }
+
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecutionContext,
+    ) -> Result<ToolResultInfo, String> {
+        let start_time = Instant::now();
+
+        ctx.emit_tool_call_start(&call.name, call.arguments.clone(), Some(&call.id));
+
+        let stripped_name = strip_tool_namespace(&call.name);
+
+        let result = match stripped_name {
+            "memory_search" => self.execute_search(call, ctx).await,
+            "memory_read" => self.execute_read(call, ctx).await,
+            "memory_write" => self.execute_write(call, ctx).await,
+            "memory_list" => self.execute_list(call, ctx).await,
+            "memory_update_by_id" => self.execute_update_by_id(call, ctx).await,
+            "memory_delete" => self.execute_delete(call, ctx).await,
+            "memory_write_smart" => self.execute_write_smart(call, ctx).await,
+            "memory_write_batch" => self.execute_write_batch(call, ctx).await,
+            _ => Err(format!("Unknown memory tool: {}", call.name)),
+        };
+
+        let duration_ms = start_time.elapsed().as_millis() as u32;
+
+        match result {
+            Ok(output) => {
+                ctx.emit_tool_call_end(Some(json!({
+                    "result": output,
+                    "durationMs": duration_ms,
+                })));
+                Ok(ToolResultInfo::success(
+                    Some(call.id.clone()),
+                    Some(ctx.block_id.clone()),
+                    call.name.clone(),
+                    call.arguments.clone(),
+                    output,
+                    duration_ms as u64,
+                ))
+            }
+            Err(e) => {
+                ctx.emit_tool_call_error(&e);
+                Ok(ToolResultInfo::failure(
+                    Some(call.id.clone()),
+                    Some(ctx.block_id.clone()),
+                    call.name.clone(),
+                    call.arguments.clone(),
+                    e,
+                    duration_ms as u64,
+                ))
+            }
+        }
+    }
+
+    fn sensitivity_level(&self, tool_name: &str) -> ToolSensitivity {
+        let stripped = strip_tool_namespace(tool_name);
+        match stripped {
+            "memory_delete" => ToolSensitivity::Medium, // 删除操作需要更高敏感度
+            _ => ToolSensitivity::Low,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "MemoryToolExecutor"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryToolExecutor;
+
+    #[test]
+    fn test_needs_root_bootstrap() {
+        assert!(MemoryToolExecutor::needs_root_bootstrap(None));
+        assert!(!MemoryToolExecutor::needs_root_bootstrap(Some("folder-1")));
+    }
+}

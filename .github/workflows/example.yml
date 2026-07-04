@@ -1,0 +1,14 @@
+# 示例：要部署到目标仓库的 workflow
+# 实际用的时候换成你自己的
+name: Example CI
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Hello from synced repo!"
