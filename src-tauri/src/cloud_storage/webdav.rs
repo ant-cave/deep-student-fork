@@ -1,0 +1,822 @@
+//! WebDAV 存储实现
+//!
+//! 基于 reqwest 的 WebDAV 客户端，支持坚果云、Nextcloud 等服务
+
+use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
+use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
+use reqwest::{Client, Method, StatusCode, Url};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
+
+use super::config::WebDavConfig;
+use super::traits::{
+    CloudStorage, DownloadProgressCallback, FileInfo, Result, UploadProgressCallback,
+};
+use crate::backup_common::calculate_file_hash;
+use crate::models::AppError;
+
+/// WebDAV 存储实现
+pub struct WebDavStorage {
+    base_url: Url,
+    username: String,
+    password: String,
+    root: String,
+    http: Client,
+}
+
+impl WebDavStorage {
+    /// 创建 WebDAV 存储实例
+    pub fn new(config: WebDavConfig, root: String) -> Result<Self> {
+        if config.endpoint.trim().is_empty() {
+            return Err(AppError::validation("WebDAV endpoint 不能为空"));
+        }
+
+        let url = Url::parse(config.endpoint.trim())
+            .map_err(|e| AppError::configuration(format!("无效的 WebDAV endpoint: {e}")))?;
+
+        let is_local = url
+            .host_str()
+            .map(|h| matches!(h.to_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1"))
+            .unwrap_or(false);
+        if !is_local && url.scheme() != "https" {
+            return Err(AppError::configuration(
+                "WebDAV endpoint 必须使用 HTTPS 以保护 Basic Auth 凭据（仅 localhost 允许 HTTP）"
+                    .to_string(),
+            ));
+        }
+
+        let http = Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30))
+            .min_tls_version(reqwest::tls::Version::TLS_1_2)
+            .build()
+            .map_err(|e| AppError::internal(format!("构建 HTTP 客户端失败: {e}")))?;
+
+        Ok(Self {
+            base_url: url,
+            username: config.username,
+            password: config.password,
+            root: root.trim_matches('/').to_string(),
+            http,
+        })
+    }
+
+    /// 构建 Basic 认证头
+    fn auth_header(&self) -> String {
+        let raw = format!("{}:{}", self.username, self.password);
+        format!("Basic {}", general_purpose::STANDARD.encode(raw))
+    }
+
+    /// 将相对 key 组合成 WebDAV 根目录下的远程路径
+    fn remote_path(&self, key: &str) -> String {
+        Self::join_paths(&self.root, key)
+    }
+
+    /// 拼接两个路径片段，去掉首尾斜杠，避免重复分隔符
+    fn join_paths(base: &str, child: &str) -> String {
+        let base = base.trim_matches('/');
+        let preserve_trailing_slash = child.ends_with('/') && !child.trim_matches('/').is_empty();
+        let child = child.trim_matches('/');
+
+        match (base.is_empty(), child.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => {
+                if preserve_trailing_slash {
+                    format!("{child}/")
+                } else {
+                    child.to_string()
+                }
+            }
+            (false, true) => base.to_string(),
+            (false, false) => {
+                if preserve_trailing_slash {
+                    format!("{base}/{child}/")
+                } else {
+                    format!("{base}/{child}")
+                }
+            }
+        }
+    }
+
+    /// 构建完整 URL
+    fn build_path_url(&self, path: &str) -> Result<Url> {
+        let mut url = self.base_url.clone();
+        let base_segments = url
+            .path()
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let remote_segments = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let preserve_trailing_slash = path.ends_with('/') && !remote_segments.is_empty();
+
+        url.set_path("");
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                AppError::configuration("WebDAV endpoint 不能作为层级路径处理".to_string())
+            })?;
+            for segment in base_segments.iter().chain(remote_segments.iter()) {
+                segments.push(segment);
+            }
+            if preserve_trailing_slash {
+                segments.push("");
+            }
+        }
+        Ok(url)
+    }
+
+    /// 构建完整 URL
+    fn build_url(&self, key: &str) -> Result<Url> {
+        self.build_path_url(&self.remote_path(key))
+    }
+
+    fn mkcol_method() -> Result<Method> {
+        Method::from_bytes(b"MKCOL")
+            .map_err(|e| AppError::internal(format!("无效 WebDAV 方法 MKCOL: {e}")))
+    }
+
+    fn propfind_method() -> Result<Method> {
+        Method::from_bytes(b"PROPFIND")
+            .map_err(|e| AppError::internal(format!("无效 WebDAV 方法 PROPFIND: {e}")))
+    }
+
+    /// 发送 HTTP 请求（带重试）
+    async fn request_with_path(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<reqwest::Response> {
+        let url = self.build_path_url(path)?;
+        let max_retries = 3;
+        let mut last_error = None;
+
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+                tokio::time::sleep(delay).await;
+                tracing::debug!("WebDAV {} 重试 {}/{}", method, attempt + 1, max_retries);
+            }
+
+            let builder = self
+                .http
+                .request(method.clone(), url.clone())
+                .header("Authorization", self.auth_header());
+
+            let builder = if let Some(ref b) = body {
+                builder.body(b.clone())
+            } else {
+                builder
+            };
+
+            match builder.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt == max_retries - 1 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(AppError::network(format!(
+            "WebDAV {} 请求失败（已重试 {} 次）: {}",
+            method,
+            max_retries,
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        )))
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        key: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<reqwest::Response> {
+        self.request_with_path(method, &self.remote_path(key), body)
+            .await
+    }
+
+    /// 确保目录存在（递归创建）
+    async fn ensure_directory(&self, path: &str) -> Result<()> {
+        let parts: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut current = String::new();
+        for part in parts {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(part);
+
+            // MKCOL 创建目录
+            let res = self
+                .request_with_path(Self::mkcol_method()?, &format!("{}/", current), None)
+                .await?;
+
+            // 405 METHOD_NOT_ALLOWED 或 409 CONFLICT 表示目录已存在，可以忽略
+            if !matches!(
+                res.status(),
+                StatusCode::OK
+                    | StatusCode::CREATED
+                    | StatusCode::METHOD_NOT_ALLOWED
+                    | StatusCode::CONFLICT
+            ) {
+                // 不是致命错误，目录可能已存在
+                tracing::debug!("WebDAV MKCOL {} 返回 {}", current, res.status());
+            }
+        }
+        Ok(())
+    }
+
+    /// 解析 PROPFIND 响应获取文件列表（使用 roxmltree 安全解析，防止 XXE 注入）
+    fn parse_propfind_response(&self, xml: &str, prefix: &str) -> Vec<FileInfo> {
+        let doc = match roxmltree::Document::parse(xml) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("WebDAV PROPFIND XML 解析失败: {e}");
+                return Vec::new();
+            }
+        };
+
+        let dav_ns = "DAV:";
+        let mut files = Vec::new();
+
+        for response in doc
+            .descendants()
+            .filter(|n| n.has_tag_name((dav_ns, "response")))
+        {
+            let href = response
+                .descendants()
+                .find(|n| n.has_tag_name((dav_ns, "href")))
+                .and_then(|n| n.text())
+                .unwrap_or_default();
+
+            if href.ends_with('/') {
+                continue;
+            }
+
+            let key = self.extract_relative_key(href, prefix);
+            if key.is_empty() {
+                continue;
+            }
+
+            let size = response
+                .descendants()
+                .find(|n| n.has_tag_name((dav_ns, "getcontentlength")))
+                .and_then(|n| n.text())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            let modified = response
+                .descendants()
+                .find(|n| n.has_tag_name((dav_ns, "getlastmodified")))
+                .and_then(|n| n.text())
+                .and_then(|s| {
+                    DateTime::parse_from_rfc2822(s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .ok()
+                })
+                .unwrap_or_else(|| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+
+            files.push(FileInfo {
+                key,
+                size,
+                last_modified: modified,
+                etag: None,
+            });
+        }
+
+        files.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+        files
+    }
+
+    fn extract_relative_key(&self, href: &str, prefix: &str) -> String {
+        // URL 解码
+        let decoded = urlencoding::decode(href).unwrap_or_else(|_| href.into());
+
+        // 提取 root 之后的路径
+        let root_path = format!("/{}/", self.root);
+        if let Some(idx) = decoded.find(&root_path) {
+            let relative = &decoded[idx + root_path.len()..];
+            // 如果有 prefix，检查是否匹配
+            if !prefix.is_empty() && relative.starts_with(prefix) {
+                return relative.to_string();
+            } else if prefix.is_empty() {
+                return relative.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// 解析 PROPFIND 响应，同时返回文件列表和子目录列表。
+    ///
+    /// RFC 4918 推荐使用 Depth:1 + 客户端迭代递归替代 Depth:infinity，
+    /// 避免依赖服务器对 infinity 的支持（坚果云等可能不支持）。
+    fn parse_propfind_entries(
+        &self,
+        xml: &str,
+        prefix: &str,
+        request_dir: &str,
+    ) -> (Vec<FileInfo>, Vec<String>) {
+        let doc = match roxmltree::Document::parse(xml) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("WebDAV PROPFIND XML 解析失败: {e}");
+                return (Vec::new(), Vec::new());
+            }
+        };
+
+        let dav_ns = "DAV:";
+        let mut files = Vec::new();
+        let mut subdirs = Vec::new();
+        let request_dir_normalized = request_dir.trim_matches('/');
+        let prefix_normalized = prefix.trim_matches('/');
+
+        for response in doc
+            .descendants()
+            .filter(|n| n.has_tag_name((dav_ns, "response")))
+        {
+            let href = response
+                .descendants()
+                .find(|n| n.has_tag_name((dav_ns, "href")))
+                .and_then(|n| n.text())
+                .unwrap_or_default();
+
+            if href.ends_with('/') {
+                // 目录项：提取相对路径（不做 prefix 过滤）
+                let key = self.extract_relative_key(href, "");
+                let dir_path = key.trim_matches('/');
+                // 跳过请求目录自身和空路径
+                if dir_path == request_dir_normalized || dir_path.is_empty() {
+                    continue;
+                }
+                // 只包含 prefix 下的子目录
+                if !prefix_normalized.is_empty() && !dir_path.starts_with(prefix_normalized) {
+                    continue;
+                }
+                subdirs.push(dir_path.to_string());
+            } else {
+                let key = self.extract_relative_key(href, prefix);
+                if key.is_empty() {
+                    continue;
+                }
+
+                let size = response
+                    .descendants()
+                    .find(|n| n.has_tag_name((dav_ns, "getcontentlength")))
+                    .and_then(|n| n.text())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let modified = response
+                    .descendants()
+                    .find(|n| n.has_tag_name((dav_ns, "getlastmodified")))
+                    .and_then(|n| n.text())
+                    .and_then(|s| {
+                        DateTime::parse_from_rfc2822(s)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .ok()
+                    })
+                    .unwrap_or_else(|| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+
+                files.push(FileInfo {
+                    key,
+                    size,
+                    last_modified: modified,
+                    etag: None,
+                });
+            }
+        }
+
+        (files, subdirs)
+    }
+}
+
+#[async_trait]
+impl CloudStorage for WebDavStorage {
+    fn provider_name(&self) -> &'static str {
+        "WebDAV"
+    }
+
+    async fn check_connection(&self) -> Result<()> {
+        // 先确保同步根目录存在，再做连接探测
+        self.ensure_directory(&self.root).await?;
+
+        // 回退：GET 根目录
+        let res = self.request(Method::GET, "", None).await?;
+        if res.status().is_success() || res.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(AppError::network(format!(
+                "WebDAV 连接检测失败: {} {}",
+                res.status(),
+                res.status().canonical_reason().unwrap_or(""),
+            )))
+        }
+    }
+
+    async fn put_file(
+        &self,
+        key: &str,
+        local_path: &Path,
+        progress: Option<UploadProgressCallback>,
+    ) -> Result<String> {
+        self.ensure_directory(&self.root).await?;
+        // 确保父目录存在
+        if let Some(parent) = key.rfind('/') {
+            let parent_path = &key[..parent];
+            if !parent_path.is_empty() {
+                self.ensure_directory(&self.remote_path(parent_path))
+                    .await?;
+            }
+        }
+
+        let metadata = std::fs::metadata(local_path)
+            .map_err(|e| AppError::file_system(format!("读取文件元信息失败: {e}")))?;
+        let file_size = metadata.len();
+        let progress: Option<Arc<UploadProgressCallback>> = progress.map(Arc::from);
+        if let Some(cb) = progress.as_ref() {
+            cb(0, file_size);
+        }
+
+        let checksum = tokio::task::spawn_blocking({
+            let path = local_path.to_path_buf();
+            move || calculate_file_hash(&path)
+        })
+        .await
+        .map_err(|e| AppError::internal(format!("计算校验和任务失败: {e}")))??;
+
+        let file = tokio::fs::File::open(local_path)
+            .await
+            .map_err(|e| AppError::file_system(format!("打开文件失败: {e}")))?;
+
+        let uploaded = Arc::new(AtomicU64::new(0));
+        let progress_cb = progress.clone();
+        let stream = ReaderStream::new(file).map(move |chunk| {
+            if let Ok(ref bytes) = chunk {
+                let new_total =
+                    uploaded.fetch_add(bytes.len() as u64, Ordering::SeqCst) + bytes.len() as u64;
+                if let Some(cb) = progress_cb.as_ref() {
+                    cb(new_total, file_size);
+                }
+            }
+            chunk
+        });
+
+        let url = self.build_url(key)?;
+        let res = self
+            .http
+            .request(Method::PUT, url)
+            .header("Authorization", self.auth_header())
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|e| AppError::network(format!("WebDAV 上传失败: {e}")))?;
+
+        if res.status().is_success() {
+            if let Some(cb) = progress.as_ref() {
+                cb(file_size, file_size);
+            }
+            Ok(checksum)
+        } else {
+            Err(AppError::network(format!(
+                "WebDAV 上传失败: {} {}",
+                res.status(),
+                res.status().canonical_reason().unwrap_or("")
+            )))
+        }
+    }
+
+    async fn get_file(
+        &self,
+        key: &str,
+        local_path: &Path,
+        expected_checksum: Option<&str>,
+        progress: Option<DownloadProgressCallback>,
+    ) -> Result<String> {
+        let info = self
+            .stat(key)
+            .await?
+            .ok_or_else(|| AppError::not_found("云端文件不存在"))?;
+        let total_size = info.size;
+        let progress: Option<Arc<DownloadProgressCallback>> = progress.map(Arc::from);
+        if let Some(cb) = progress.as_ref() {
+            cb(0, total_size);
+        }
+
+        let res = self.request(Method::GET, key, None).await?;
+
+        if res.status() == StatusCode::NOT_FOUND {
+            return Err(AppError::not_found("云端文件不存在"));
+        }
+        if !res.status().is_success() {
+            return Err(AppError::network(format!(
+                "WebDAV 下载失败: {} {}",
+                res.status(),
+                res.status().canonical_reason().unwrap_or(""),
+            )));
+        }
+
+        let parent = local_path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::file_system(format!("创建目录失败 {:?}: {}", parent, e)))?;
+        let _temp_file = tempfile::Builder::new()
+            .prefix(".download-")
+            .tempfile_in(parent)
+            .map_err(|e| AppError::file_system(format!("创建临时下载文件失败: {e}")))?;
+        let temp_path = _temp_file.path().to_path_buf();
+
+        let mut hasher = Sha256::new();
+        let mut downloaded = 0u64;
+        {
+            let mut file = tokio::fs::File::create(&temp_path)
+                .await
+                .map_err(|e| AppError::file_system(format!("创建文件失败: {e}")))?;
+
+            let mut stream = res.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.map_err(|e| AppError::network(format!("读取响应体失败: {e}")))?;
+                file.write_all(&bytes)
+                    .await
+                    .map_err(|e| AppError::file_system(format!("写入文件失败: {e}")))?;
+                hasher.update(&bytes);
+                downloaded += bytes.len() as u64;
+                if let Some(cb) = progress.as_ref() {
+                    cb(downloaded, total_size);
+                }
+            }
+            file.flush()
+                .await
+                .map_err(|e| AppError::file_system(format!("刷新文件失败: {e}")))?;
+        }
+
+        let checksum = format!("{:x}", hasher.finalize());
+        if let Some(expected) = expected_checksum {
+            if expected != checksum {
+                return Err(AppError::validation(format!(
+                    "校验失败：期望 {}, 实际 {}",
+                    expected, checksum
+                )));
+            }
+        }
+        tokio::fs::rename(&temp_path, local_path)
+            .await
+            .map_err(|e| AppError::file_system(format!("保存下载文件失败: {e}")))?;
+        Ok(checksum)
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.ensure_directory(&self.root).await?;
+        // 确保父目录存在
+        if let Some(parent) = key.rfind('/') {
+            let parent_path = &key[..parent];
+            if !parent_path.is_empty() {
+                self.ensure_directory(&self.remote_path(parent_path))
+                    .await?;
+            }
+        }
+
+        let res = self.request(Method::PUT, key, Some(data.to_vec())).await?;
+
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(AppError::network(format!(
+                "WebDAV 上传失败: {} {}",
+                res.status(),
+                res.status().canonical_reason().unwrap_or(""),
+            )))
+        }
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let res = self.request(Method::GET, key, None).await?;
+
+        if res.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            return Err(AppError::network(format!(
+                "WebDAV 下载失败: {} {}",
+                res.status(),
+                res.status().canonical_reason().unwrap_or(""),
+            )));
+        }
+
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| AppError::network(format!("读取响应体失败: {e}")))?;
+        Ok(Some(bytes.to_vec()))
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
+        let start_path = if prefix.is_empty() {
+            String::new()
+        } else {
+            prefix.trim_matches('/').to_string()
+        };
+
+        let propfind_body = r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/><d:getcontentlength/></d:prop></d:propfind>"#;
+
+        let mut all_files = Vec::new();
+        let mut dirs_to_visit = vec![start_path];
+        // 坚果云单次 PROPFIND 上限 750 条目
+        const JIANGUOYUN_PROPFIND_LIMIT: usize = 750;
+        const MAX_DIRS: usize = 200;
+        let mut visited = 0usize;
+
+        while let Some(dir) = dirs_to_visit.pop() {
+            visited += 1;
+            if visited > MAX_DIRS {
+                tracing::warn!("[WebDAV] 递归列举已访问 {MAX_DIRS} 个目录，停止遍历以防异常");
+                break;
+            }
+
+            // RFC 4918: PROPFIND 对集合的 Request-URI 应以 `/` 结尾，
+            // 否则某些服务器返回 301 重定向，而 reqwest 默认不对非 GET 方法跟随重定向。
+            let dir_with_slash = if dir.is_empty() || dir.ends_with('/') {
+                dir.clone()
+            } else {
+                format!("{}/", dir)
+            };
+            let url = self.build_url(&dir_with_slash)?;
+
+            let res = self
+                .http
+                .request(Self::propfind_method()?, url)
+                .header("Authorization", self.auth_header())
+                .header("Depth", "1")
+                .header("Content-Type", "application/xml")
+                .body(propfind_body)
+                .send()
+                .await
+                .map_err(|e| AppError::network(format!("WebDAV PROPFIND 请求失败: {e}")))?;
+
+            if res.status() == StatusCode::NOT_FOUND {
+                continue;
+            }
+            if !res.status().is_success() {
+                return Err(AppError::network(format!(
+                    "WebDAV PROPFIND 失败: {} {}",
+                    res.status(),
+                    res.status().canonical_reason().unwrap_or(""),
+                )));
+            }
+
+            let xml = res
+                .text()
+                .await
+                .map_err(|e| AppError::network(format!("读取 PROPFIND 响应失败: {e}")))?;
+
+            let (files, subdirs) = self.parse_propfind_entries(&xml, prefix, &dir);
+
+            let entry_count = files.len() + subdirs.len();
+            if entry_count >= JIANGUOYUN_PROPFIND_LIMIT - 1 {
+                // [P1 Fix] 当条目数达到平台上限时，记录错误级别日志并继续。
+                // 不能直接返回 Err，否则 prune_old_changes 内部的 list() 也会失败，
+                // 导致用户无法通过清理来解决问题（鸡生蛋死锁）。
+                // 返回已列出的文件，让调用方至少能处理已知文件（如执行清理）。
+                tracing::error!(
+                    "[WebDAV] PROPFIND 返回 {} 条目（达到坚果云 {} 上限），\
+                     目录 '{}' 下可能有未列出的文件！建议尽快清理旧的同步变更文件。",
+                    entry_count,
+                    JIANGUOYUN_PROPFIND_LIMIT,
+                    dir
+                );
+            }
+
+            all_files.extend(files);
+            dirs_to_visit.extend(subdirs);
+        }
+
+        all_files.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+        Ok(all_files)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let res = self.request(Method::DELETE, key, None).await?;
+
+        if res.status().is_success() || res.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(AppError::network(format!(
+                "WebDAV 删除失败: {} {}",
+                res.status(),
+                res.status().canonical_reason().unwrap_or(""),
+            )))
+        }
+    }
+
+    async fn stat(&self, key: &str) -> Result<Option<FileInfo>> {
+        let url = self.build_url(key)?;
+
+        let res = self
+            .http
+            .request(Self::propfind_method()?, url)
+            .header("Authorization", self.auth_header())
+            .header("Depth", "0")
+            .header("Content-Type", "application/xml")
+            .body(r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/><d:getcontentlength/></d:prop></d:propfind>"#)
+            .send()
+            .await
+            .map_err(|e| AppError::network(format!("WebDAV PROPFIND 请求失败: {e}")))?;
+
+        if res.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            return Err(AppError::network(format!(
+                "WebDAV PROPFIND 失败: {} {}",
+                res.status(),
+                res.status().canonical_reason().unwrap_or(""),
+            )));
+        }
+
+        let xml = res
+            .text()
+            .await
+            .map_err(|e| AppError::network(format!("读取 PROPFIND 响应失败: {e}")))?;
+
+        let files = self.parse_propfind_response(&xml, "");
+        Ok(files.into_iter().next())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_storage() -> WebDavStorage {
+        WebDavStorage::new(
+            WebDavConfig {
+                endpoint: "http://localhost:8080/".to_string(),
+                username: "webdav".to_string(),
+                password: "webdav123".to_string(),
+            },
+            "deep-student-sync-contract/webdav/uuid".to_string(),
+        )
+        .expect("create test storage")
+    }
+
+    #[test]
+    fn build_url_adds_root_once() {
+        let storage = test_storage();
+        let url = storage
+            .build_url("objects/basic/hello.txt")
+            .expect("build url");
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:8080/deep-student-sync-contract/webdav/uuid/objects/basic/hello.txt"
+        );
+    }
+
+    #[test]
+    fn build_path_url_uses_raw_server_path() {
+        let storage = test_storage();
+        let url = storage
+            .build_path_url("deep-student-sync-contract/webdav/uuid/")
+            .expect("build raw path url");
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:8080/deep-student-sync-contract/webdav/uuid/"
+        );
+    }
+
+    #[test]
+    fn remote_path_joins_once() {
+        let storage = test_storage();
+        assert_eq!(
+            storage.remote_path("objects/basic/hello.txt"),
+            "deep-student-sync-contract/webdav/uuid/objects/basic/hello.txt"
+        );
+        assert_eq!(
+            storage.remote_path("objects/"),
+            "deep-student-sync-contract/webdav/uuid/objects/"
+        );
+        assert_eq!(
+            storage.build_url("objects/").unwrap().path(),
+            "/deep-student-sync-contract/webdav/uuid/objects/"
+        );
+    }
+}

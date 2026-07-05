@@ -1,0 +1,65 @@
+{
+  "sections": {
+    "smartViews": "Smart Views",
+    "lists": "Lists"
+  },
+  "views": {
+    "inbox": "Inbox",
+    "today": "Today",
+    "upcoming": "Upcoming",
+    "overdue": "Overdue",
+    "completed": "Completed"
+  },
+  "actions": {
+    "quickAddPlaceholder": "Add a todo...",
+    "add": "Add",
+    "search": "Search",
+    "searchLists": "Search lists...",
+    "newList": "New list",
+    "newListPlaceholder": "New list name...",
+    "favorite": "Favorite",
+    "unfavorite": "Unfavorite",
+    "startFocusSession": "Start Focus Session"
+  },
+  "filters": {
+    "showCompleted": "Show Completed"
+  },
+  "stats": {
+    "pending": "pending",
+    "completed": "completed"
+  },
+  "empty": {
+    "noItems": "No items yet",
+    "hint": "Keep the momentum going.",
+    "noLists": "No lists yet",
+    "noMatchingLists": "No matching lists"
+  },
+  "detail": {
+    "title": "Details",
+    "updatedAt": "Updated {{date}}"
+  },
+  "fields": {
+    "status": "Status",
+    "priority": "Priority",
+    "dueDate": "Due Date",
+    "dueTime": "Time",
+    "description": "Description",
+    "pomodoros": "Pomodoros"
+  },
+  "status": {
+    "completed": "Completed",
+    "pending": "Pending",
+    "cancelled": "Cancelled"
+  },
+  "priority": {
+    "none": "None",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "urgent": "Urgent"
+  },
+  "placeholders": {
+    "description": "Add a description...",
+    "title": "Task title"
+  }
+}

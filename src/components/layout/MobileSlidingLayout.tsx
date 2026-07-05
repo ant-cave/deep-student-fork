@@ -1,0 +1,481 @@
+/**
+ * MobileSlidingLayout - 移动端推拉式三屏滑动布局
+ *
+ * DeepSeek 风格：侧边栏、主视图、右侧面板连为一体，滑动时整体平移
+ * 可选主内容遮罩，用于贴近 study-ui 抽屉式侧边栏
+ * 支持触摸和鼠标拖拽
+ *
+ * 三屏布局：左侧栏 ← 中间主视图 → 右侧面板
+ */
+
+import React, { useRef, useState, useCallback, useEffect, useId, type ReactNode } from 'react';
+import { cn } from '@/lib/utils';
+import { Z_INDEX } from '@/config/zIndex';
+import { useMobileLayoutSafe } from './MobileLayoutContext';
+import { MobileSidebarNavigation } from './MobileSidebarNavigation';
+
+/** 三屏位置枚举 */
+export type ScreenPosition = 'left' | 'center' | 'right';
+
+/** 需要放行手势的交互元素选择器，避免阻断点击 */
+const INTERACTIVE_SELECTOR = 'button, [role="button"], a, input, select, textarea, option, label, [data-gesture-ignore]';
+
+const isInteractiveTarget = (target: EventTarget | null): boolean => {
+  if (!(target instanceof Element)) return false;
+  return Boolean(target.closest(INTERACTIVE_SELECTOR));
+};
+
+interface MobileSlidingLayoutProps {
+  /** 侧边栏内容 */
+  sidebar: ReactNode;
+  /** 主内容 */
+  children: ReactNode;
+  /** 右侧面板内容（可选，用于三屏布局） */
+  rightPanel?: ReactNode;
+  /** 侧边栏是否打开（两屏模式兼容） */
+  sidebarOpen?: boolean;
+  /** 侧边栏状态变化回调（两屏模式兼容） */
+  onSidebarOpenChange?: (open: boolean) => void;
+  /** 当前屏幕位置（三屏模式） */
+  screenPosition?: ScreenPosition;
+  /** 屏幕位置变化回调（三屏模式） */
+  onScreenPositionChange?: (position: ScreenPosition) => void;
+  /**
+   * 侧边栏宽度
+   * - 数字：固定像素宽度（默认 280px）
+   * - 'auto'：自动计算为接近全屏宽度（100vw - mainContentPeekWidth）
+   * - 'half'：容器宽度的 50%
+   */
+  sidebarWidth?: number | 'auto' | 'half';
+  /**
+   * 主内容露出宽度（仅当 sidebarWidth='auto' 时生效）
+   * 默认 60px，让主内容露出一小部分作为视觉提示
+   */
+  mainContentPeekWidth?: number;
+  /** 是否启用手势滑动，默认 true */
+  enableGesture?: boolean;
+  /** 触发滑动的边缘宽度，默认 20px */
+  edgeWidth?: number;
+  /** 滑动阈值比例，超过则切换状态，默认 0.3 */
+  threshold?: number;
+  /** 容器类名 */
+  className?: string;
+  /** 右侧面板是否可用（只有可用时才能滑动到右侧） */
+  rightPanelEnabled?: boolean;
+  /** 是否自动注入移动端应用导航 */
+  showSidebarAppNavigation?: boolean;
+  /** 侧边栏打开时是否给主内容加遮罩 */
+  showContentOverlay?: boolean;
+}
+
+export const MobileSlidingLayout: React.FC<MobileSlidingLayoutProps> = ({
+  sidebar,
+  children,
+  rightPanel,
+  sidebarOpen,
+  onSidebarOpenChange,
+  screenPosition: screenPositionProp,
+  onScreenPositionChange,
+  sidebarWidth: sidebarWidthProp = 'auto',
+  mainContentPeekWidth = 60,
+  enableGesture = true,
+  threshold = 0.3,
+  className,
+  rightPanelEnabled = false,
+  showSidebarAppNavigation = true,
+  showContentOverlay = false,
+}) => {
+  // 判断是否为三屏模式
+  const isThreeScreenMode = rightPanel !== undefined && onScreenPositionChange !== undefined;
+
+  // 三屏模式下的屏幕位置，两屏模式下通过 sidebarOpen 推断
+  const screenPosition: ScreenPosition = isThreeScreenMode
+    ? (screenPositionProp ?? 'center')
+    : (sidebarOpen ? 'left' : 'center');
+  const containerRef = useRef<HTMLDivElement>(null);
+  const stateRef = useRef({
+    isDragging: false,
+    startX: 0,
+    startY: 0,
+    currentTranslate: 0,
+    axisLocked: null as 'horizontal' | 'vertical' | null,
+    baseTranslate: 0,
+    /** 拖拽开始时的 baseTranslate 快照，拖拽过程中不会被渲染更新覆盖 */
+    dragStartBase: 0,
+  });
+
+  // 用于触发重渲染
+  const [, forceUpdate] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [currentTranslate, setCurrentTranslate] = useState(0);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const [isActiveViewLayer, setIsActiveViewLayer] = useState(true);
+  const mobileLayout = useMobileLayoutSafe();
+  const isMobileLayout = mobileLayout?.isMobile ?? false;
+  const enterFullscreen = mobileLayout?.enterFullscreen;
+  const exitFullscreen = mobileLayout?.exitFullscreen;
+  const fullscreenClaimId = useId();
+  const hasSidebar = sidebar !== null && sidebar !== undefined;
+
+  // 监听容器宽度变化
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const updateWidth = () => {
+      setContainerWidth(container.clientWidth);
+    };
+
+    // 初始化宽度
+    updateWidth();
+
+    // 使用 ResizeObserver 监听容器尺寸变化
+    const resizeObserver = new ResizeObserver(updateWidth);
+    resizeObserver.observe(container);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  // The app keeps visited views mounted. Only the visible layer should be allowed
+  // to hide the global bottom tab bar when one of its side panels is open.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const viewLayer = container.closest('[data-view-layer-shell]');
+    if (!viewLayer) {
+      setIsActiveViewLayer(true);
+      return;
+    }
+
+    const updateActiveState = () => {
+      const style = window.getComputedStyle(viewLayer);
+      setIsActiveViewLayer(
+        style.visibility !== 'hidden' &&
+        style.pointerEvents !== 'none' &&
+        style.opacity !== '0'
+      );
+    };
+
+    updateActiveState();
+    const observer = new MutationObserver(updateActiveState);
+    observer.observe(viewLayer, { attributes: true, attributeFilter: ['class', 'style'] });
+
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const shouldHideBottomTab = Boolean(
+      isMobileLayout &&
+      isActiveViewLayer &&
+      (screenPosition !== 'center' || isDragging)
+    );
+
+    if (shouldHideBottomTab) {
+      enterFullscreen?.(fullscreenClaimId);
+    } else {
+      exitFullscreen?.(fullscreenClaimId);
+    }
+
+    return () => {
+      exitFullscreen?.(fullscreenClaimId);
+    };
+  }, [enterFullscreen, exitFullscreen, fullscreenClaimId, isActiveViewLayer, isDragging, isMobileLayout, screenPosition]);
+
+  // 计算实际侧边栏宽度
+  const sidebarWidth = sidebarWidthProp === 'auto'
+    ? Math.max(containerWidth - mainContentPeekWidth, 280) // 最小 280px
+    : sidebarWidthProp === 'half'
+      ? Math.max(Math.round(containerWidth / 2), 180)
+      : sidebarWidthProp;
+
+  // 计算当前偏移量（三屏模式）
+  const getBaseTranslate = useCallback(() => {
+    switch (screenPosition) {
+      case 'left': return 0; // 显示左侧边栏
+      case 'center': return -sidebarWidth; // 显示中间主视图
+      case 'right': return -(sidebarWidth + containerWidth); // 显示右侧面板
+      default: return -sidebarWidth;
+    }
+  }, [screenPosition, sidebarWidth, containerWidth]);
+
+  const baseTranslate = getBaseTranslate();
+  // 仅在未拖拽时同步 baseTranslate，防止拖拽中途被渲染更新覆盖
+  if (!stateRef.current.isDragging) {
+    stateRef.current.baseTranslate = baseTranslate;
+  }
+
+  // 处理开始拖拽（触摸/鼠标）
+  const handleDragStart = useCallback((clientX: number, clientY: number) => {
+    if (!enableGesture) return;
+
+    stateRef.current.isDragging = true;
+    stateRef.current.startX = clientX;
+    stateRef.current.startY = clientY;
+    stateRef.current.currentTranslate = baseTranslate;
+    stateRef.current.axisLocked = null;
+    stateRef.current.dragStartBase = baseTranslate;
+    stateRef.current.baseTranslate = baseTranslate;
+
+    setIsDragging(true);
+    setCurrentTranslate(baseTranslate);
+  }, [enableGesture, baseTranslate]);
+
+  // 处理拖拽移动
+  const handleDragMove = useCallback((clientX: number, clientY: number, preventDefault: () => void) => {
+    if (!enableGesture || !stateRef.current.isDragging) return;
+
+    const deltaX = clientX - stateRef.current.startX;
+    const deltaY = clientY - stateRef.current.startY;
+
+    // 首先确定滑动轴向（只判断一次）
+    if (stateRef.current.axisLocked === null && (Math.abs(deltaX) > 10 || Math.abs(deltaY) > 10)) {
+      // 水平滑动幅度大于垂直滑动的 1.2 倍，认为是水平滑动
+      if (Math.abs(deltaX) > Math.abs(deltaY) * 1.2) {
+        stateRef.current.axisLocked = 'horizontal';
+      } else {
+        // 垂直滑动，取消拖拽，让原生滚动接管
+        stateRef.current.axisLocked = 'vertical';
+        stateRef.current.isDragging = false;
+        setIsDragging(false);
+        return;
+      }
+    }
+
+    // 如果是垂直滑动，不处理
+    if (stateRef.current.axisLocked === 'vertical') {
+      return;
+    }
+
+    // 水平滑动时阻止默认行为
+    if (stateRef.current.axisLocked === 'horizontal') {
+      preventDefault();
+    }
+
+    // 轴向尚未确定时不更新位置，避免微小偏移
+    if (stateRef.current.axisLocked !== 'horizontal') {
+      return;
+    }
+
+    // 计算新的偏移量（使用拖拽开始时的快照，防止中途被渲染更新干扰）
+    let newTranslate = stateRef.current.dragStartBase + deltaX;
+
+    // 限制范围：三屏模式下考虑右侧面板
+    const minTranslate = isThreeScreenMode && rightPanelEnabled
+      ? -(sidebarWidth + containerWidth) // 可以滑动到右侧面板
+      : -sidebarWidth; // 两屏模式或右侧面板不可用
+    const maxTranslate = 0;
+    newTranslate = Math.max(minTranslate, Math.min(maxTranslate, newTranslate));
+
+    stateRef.current.currentTranslate = newTranslate;
+    setCurrentTranslate(newTranslate);
+  }, [enableGesture, sidebarWidth, containerWidth, isThreeScreenMode, rightPanelEnabled]);
+
+  // 处理拖拽结束
+  const handleDragEnd = useCallback(() => {
+    if (!stateRef.current.isDragging) {
+      stateRef.current.axisLocked = null;
+      return;
+    }
+
+    const deltaX = stateRef.current.currentTranslate - stateRef.current.dragStartBase;
+    const thresholdPx = sidebarWidth * threshold;
+
+    // 三屏模式下的状态切换逻辑
+    if (isThreeScreenMode && onScreenPositionChange) {
+      if (Math.abs(deltaX) > thresholdPx) {
+        if (deltaX > 0) {
+          // 向右滑动
+          if (screenPosition === 'center') onScreenPositionChange('left');
+          else if (screenPosition === 'right') onScreenPositionChange('center');
+        } else {
+          // 向左滑动
+          if (screenPosition === 'center' && rightPanelEnabled) onScreenPositionChange('right');
+          else if (screenPosition === 'left') onScreenPositionChange('center');
+        }
+      }
+    } else if (onSidebarOpenChange) {
+      // 两屏模式兼容逻辑
+      const progress = Math.abs(deltaX) / sidebarWidth;
+      if (sidebarOpen) {
+        if (deltaX < 0 && progress > threshold) {
+          onSidebarOpenChange(false);
+        }
+      } else {
+        if (deltaX > 0 && progress > threshold) {
+          onSidebarOpenChange(true);
+        }
+      }
+    }
+
+    stateRef.current.isDragging = false;
+    stateRef.current.axisLocked = null;
+    setIsDragging(false);
+  }, [sidebarWidth, sidebarOpen, threshold, onSidebarOpenChange, isThreeScreenMode, onScreenPositionChange, screenPosition, rightPanelEnabled]);
+
+  const closeSidebarAfterAppNavigation = useCallback(() => {
+    if (isThreeScreenMode && onScreenPositionChange) {
+      onScreenPositionChange('center');
+      return;
+    }
+
+    onSidebarOpenChange?.(false);
+  }, [isThreeScreenMode, onScreenPositionChange, onSidebarOpenChange]);
+
+  // 绑定原生事件（支持 passive: false）
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    // 触摸事件
+    const onTouchStart = (e: TouchEvent) => {
+      if (isInteractiveTarget(e.target)) return;
+      const touch = e.touches[0];
+      handleDragStart(touch.clientX, touch.clientY);
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      const touch = e.touches[0];
+      handleDragMove(touch.clientX, touch.clientY, () => e.preventDefault());
+    };
+
+    const onTouchEnd = () => {
+      handleDragEnd();
+    };
+
+    // 鼠标事件
+    const onMouseDown = (e: MouseEvent) => {
+      // 只响应左键
+      if (e.button !== 0) return;
+      if (isInteractiveTarget(e.target)) return;
+      handleDragStart(e.clientX, e.clientY);
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!stateRef.current.isDragging) return;
+      handleDragMove(e.clientX, e.clientY, () => e.preventDefault());
+    };
+
+    const onMouseUp = () => {
+      handleDragEnd();
+    };
+
+    // 页面失焦 / 上下文菜单弹出时，强制结束拖拽，防止 isDragging 卡死
+    const onDragAbort = () => {
+      if (stateRef.current.isDragging) {
+        handleDragEnd();
+      }
+    };
+
+    // 绑定触摸事件
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: false });
+    container.addEventListener('touchend', onTouchEnd, { passive: true });
+    container.addEventListener('touchcancel', onTouchEnd, { passive: true });
+
+    // 绑定鼠标事件
+    container.addEventListener('mousedown', onMouseDown);
+    // mousemove 和 mouseup 绑定到 document，以便在容器外也能响应
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+
+    // 安全兜底：页面不可见或弹出菜单时结束拖拽
+    document.addEventListener('visibilitychange', onDragAbort);
+    document.addEventListener('contextmenu', onDragAbort);
+
+    return () => {
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+      container.removeEventListener('touchend', onTouchEnd);
+      container.removeEventListener('touchcancel', onTouchEnd);
+      container.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      document.removeEventListener('visibilitychange', onDragAbort);
+      document.removeEventListener('contextmenu', onDragAbort);
+    };
+  }, [handleDragStart, handleDragMove, handleDragEnd]);
+
+  // 计算最终的 transform 值
+  const translateX = isDragging ? currentTranslate : baseTranslate;
+  const sidebarRevealProgress = showContentOverlay && hasSidebar
+    ? Math.max(0, Math.min(1, (translateX + sidebarWidth) / Math.max(sidebarWidth, 1)))
+    : 0;
+  const isSidebarOverlayInteractive = sidebarRevealProgress > 0.98 && screenPosition === 'left' && !isDragging;
+
+  // 计算容器总宽度
+  const totalWidth = isThreeScreenMode
+    ? sidebarWidth + containerWidth + containerWidth // 三屏：侧栏 + 主视图 + 右侧面板
+    : sidebarWidth + containerWidth; // 两屏：侧栏 + 主视图
+
+  return (
+    <div
+      ref={containerRef}
+      className={cn('relative h-full overflow-hidden select-none', className)}
+      style={{
+        touchAction: 'pan-y pinch-zoom',
+        cursor: isDragging ? 'grabbing' : 'default',
+        zIndex: Z_INDEX.drawer,
+      }}
+    >
+      <div
+        className="flex h-full"
+        style={{
+          width: totalWidth || `calc(100% + ${sidebarWidth}px)`,
+          transform: `translateX(${translateX}px)`,
+          transition: isDragging ? 'none' : 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+        }}
+      >
+        {/* 侧边栏 */}
+        <div
+          className="relative z-[2] flex h-full min-h-0 flex-shrink-0 flex-col bg-background"
+          style={{ width: sidebarWidth }}
+        >
+          <div className="min-h-0 flex-1 overflow-hidden">
+            {sidebar}
+          </div>
+          {hasSidebar && isMobileLayout && showSidebarAppNavigation && (
+            <MobileSidebarNavigation onNavigate={closeSidebarAfterAppNavigation} />
+          )}
+        </div>
+
+        {/* 主内容区域 - 宽度等于外层容器宽度（视口宽度） */}
+        <div
+          className="relative z-[1] h-full flex-shrink-0 overflow-x-hidden bg-background"
+          style={{ width: containerWidth || '100vw' }}
+        >
+          {showContentOverlay && hasSidebar && (
+            <button
+              type="button"
+              aria-label="关闭侧边栏"
+              aria-hidden={sidebarRevealProgress <= 0.02}
+              tabIndex={isSidebarOverlayInteractive ? 0 : -1}
+              onClick={closeSidebarAfterAppNavigation}
+              data-mobile-sidebar-mask
+              className="absolute inset-0 z-[60] appearance-none border-0 bg-[color:var(--overlay)] p-0 backdrop-blur-[2px] transition-opacity duration-300 ease-out motion-reduce:transition-none"
+              style={{
+                opacity: sidebarRevealProgress,
+                pointerEvents: isSidebarOverlayInteractive ? 'auto' : 'none',
+              }}
+            />
+          )}
+          {children}
+        </div>
+
+        {/* 右侧面板（三屏模式） */}
+        {isThreeScreenMode && (
+          <div
+            className="flex flex-col bg-background"
+            style={{ width: containerWidth || '100vw', height: '100%' }}
+          >
+            {rightPanel}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default MobileSlidingLayout;
